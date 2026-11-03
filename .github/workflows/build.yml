@@ -8,6 +8,15 @@ on:
       - 'pluginmaster.json'
   pull_request:
   workflow_dispatch:
+    inputs:
+      plugins:
+        description: 'Optional comma-separated plugin names; blank detects changed manifest versions'
+        required: false
+        type: string
+      tag:
+        description: 'Optional release tag, e.g. v0.1.1'
+        required: false
+        type: string
 permissions:
   contents: read
 jobs:
@@ -24,21 +33,60 @@ jobs:
       - name: Build and test
         shell: pwsh
         run: ./scripts/Build.ps1
-      - name: Package
+      - name: Package changed plugins
+        id: package
         shell: pwsh
         env:
           BUILD_REF: ${{ github.ref_name }}
           BUILD_REF_TYPE: ${{ github.ref_type }}
           BUILD_REPOSITORY: ${{ github.repository }}
+          REQUESTED_PLUGINS: ${{ inputs.plugins }}
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
-          $version = [Version](Get-Content plugins/BatchTrade/BatchTrade.json -Raw | ConvertFrom-Json).AssemblyVersion
-          $tag = if ($env:BUILD_REF_TYPE -eq 'tag') { $env:BUILD_REF } elseif ($version.Revision -gt 0) { 'v' + $version.ToString() } else { 'v' + $version.ToString(3) }
-          ./scripts/Package.ps1 -Tag $tag -Repository $env:BUILD_REPOSITORY
+          $ErrorActionPreference = 'Stop'
+          $known = @('BatchTrade', 'RetainerCraftBridge')
+          $index = @(Get-Content pluginmaster.json -Raw | ConvertFrom-Json)
+          $manifests = @{}
+          foreach ($name in $known) {
+            $manifests[$name] = Get-Content "plugins/$name/$name.json" -Raw | ConvertFrom-Json
+          }
+          $tag = if ($env:BUILD_REF_TYPE -eq 'tag') { $env:BUILD_REF } else { $env:REQUESTED_TAG }
+          if (![string]::IsNullOrWhiteSpace($env:REQUESTED_PLUGINS)) {
+            $selected = @($env:REQUESTED_PLUGINS.Split(',') | ForEach-Object { $_.Trim() })
+            if (@($selected | Where-Object { $_ -cnotin $known }).Count -gt 0) { throw 'Unknown plugin selection.' }
+          } elseif ($env:BUILD_REF_TYPE -eq 'tag') {
+            if ($tag -notmatch '^v\d+\.\d+\.\d+(?:\.\d+)?$') { throw 'Invalid release tag.' }
+            $version = [Version]$tag.Substring(1)
+            $version = [Version]::new($version.Major, $version.Minor, [Math]::Max(0, $version.Build), [Math]::Max(0, $version.Revision))
+            $selected = @($known | Where-Object { [Version]$manifests[$_].AssemblyVersion -eq $version })
+            if ($selected.Count -eq 0) { throw 'No plugin manifest matches this release tag.' }
+          } else {
+            $selected = @($known | Where-Object {
+              $name = $_
+              $previous = @($index | Where-Object InternalName -CEQ $name)
+              $previous.Count -ne 1 -or [Version]$previous[0].AssemblyVersion -ne [Version]$manifests[$name].AssemblyVersion
+            })
+          }
+          if ($selected.Count -eq 0) {
+            'packaged=false' >> $env:GITHUB_OUTPUT
+            Write-Host 'No plugin version changes; build and tests completed without packaging.'
+            exit 0
+          }
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            $versions = @($selected | ForEach-Object { $manifests[$_].AssemblyVersion } | Select-Object -Unique)
+            if ($versions.Count -ne 1) { throw 'Changed plugins have different versions; dispatch one release with explicit plugins/tag.' }
+            $version = [Version]$versions[0]
+            $tag = if ($version.Revision -gt 0) { 'v' + $version.ToString() } else { 'v' + $version.ToString(3) }
+          }
+          ./scripts/Package.ps1 -Tag $tag -Repository $env:BUILD_REPOSITORY -Plugins $selected
+          "directory=artifacts/$tag" >> $env:GITHUB_OUTPUT
+          'packaged=true' >> $env:GITHUB_OUTPUT
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.package.outputs.packaged == 'true'
         with:
           name: plugin-packages
           path: |
-            artifacts/*.zip
-            artifacts/pluginmaster.json
-            artifacts/SHA256SUMS.txt
+            ${{ steps.package.outputs.directory }}/*.zip
+            ${{ steps.package.outputs.directory }}/pluginmaster.json
+            ${{ steps.package.outputs.directory }}/SHA256SUMS.txt
           if-no-files-found: error

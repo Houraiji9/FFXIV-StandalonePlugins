@@ -17,7 +17,7 @@ This repository is distributed under AGPL-3.0; see LICENSE. It does not bundle t
 ## Host references
 
 - Dalamud Soil [26-11-03-01](https://github.com/Dalamud-DailyRoutines/Dalamud/releases/tag/26-11-03-01), commit `4a191c4072677489277f59141b795042c22436ad`, API 15. Build-only references remain provided by the host at runtime.
-- [FFXIVClientStructs](https://github.com/Dalamud-DailyRoutines/FFXIVClientStructs/tree/87d51a788ee33329f20b06243be332dd4d35b13c), MIT, via the host. Native layouts and official generated bindings are used without introducing new byte signatures or arbitrary offsets.
+- [FFXIVClientStructs](https://github.com/Dalamud-DailyRoutines/FFXIVClientStructs/tree/87d51a788ee33329f20b06243be332dd4d35b13c), MIT, via the host. The plugins use the host's generated native bindings. BatchTrade 0.1.1 additionally identifies two embedded InventoryManager callback receivers using an explicitly version-gated layout verified against the CN `2026.10.06.0000.0000` executable; these private fields are not exposed by this FFCS revision. The adapter only checks receiver identity and event kind; it does not call a hand-written native function or add a byte signature. No executable bytes are redistributed.
 - The SDK acquisition script downloads the official [7-Zip 26.05 standalone extractor](https://github.com/ip7z/7zip/releases/tag/26.05) for build use, with a pinned SHA-256. It is not redistributed in the plugin packages.
 
 Upstream names and trademarks belong to their respective owners. Runtime dependency settings and ownership remain with their original plugins.

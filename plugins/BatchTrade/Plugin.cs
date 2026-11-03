@@ -6,6 +6,7 @@ using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Game.Chat;
 using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Game.Command;
+using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
@@ -28,36 +29,61 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private readonly IDataManager data;
     private readonly IAddonLifecycle lifecycle;
     private readonly IPluginLog log;
+    private readonly string? gameVersion;
+    private bool Compatible => GameCompatibility.IsSupported(gameVersion, sizeof(InventoryManager));
     private volatile bool windowOpen;
     private volatile bool disposed;
     private int pendingUiActions, stopGeneration;
     private long nextTick;
     private string? dispatchError;
 
-    private enum Stage { Idle, Requesting, OpeningMenu, SelectingMenu, WaitingItem, Ready, AwaitFinal, Settlement, BetweenBatches }
+    private enum Stage { Idle, Starting, SendingRequest, Requesting, OpeningMenu, SelectingMenu, WaitingItem, Ready, AwaitFinal, Settlement, BetweenBatches }
     [Serializable]
     public sealed class Config : IPluginConfiguration
     {
-        public int Version { get; set; } = 1;
+        public int Version { get; set; } = 2;
         public uint ItemId;
         public bool HighQuality;
         public int TotalQuantity = 1;
         public int TimeoutSeconds = 90;
+        public int BatchQuantityCap = 999;
+        public int StartupDelayMs = 1000;
+        public int RequestDelayMs = 800;
+        public int OpenMenuDelayMs = 500;
+        public int SelectMenuDelayMs = 500;
+        public int QuantityDelayMs = 800;
+        public int CloseMenuDelayMs = 500;
+        public int ProposeDelayMs = 800;
+        public int FinalConfirmDelayMs = 1000;
+        public int CancelDelayMs = 300;
+        public int BetweenTradesMs = 1500;
     }
     private readonly record struct Identity(uint Entity, string Name, ushort World);
-    private readonly record struct StartRequest(uint ItemId, bool HighQuality, int TotalQuantity, int TimeoutSeconds, Identity? Target);
-    private sealed record UiSnapshot(bool Running, bool FinalSubmitted, int Goal, int Delivered,
-        string RecipientLabel, Identity? Target, uint[] ItemIds, IReadOnlyDictionary<ItemKey, long> Totals, string Status);
-    private UiSnapshot uiSnapshot = new(false, false, 0, 0, "", null, [], new Dictionary<ItemKey, long>(),
-        "请选择物品、品质和总数量，然后选中接收玩家。");
+    private readonly record struct StartRequest(uint ItemId, bool HighQuality, int TotalQuantity, int TimeoutSeconds, int BatchQuantityCap, TradeDelays Delays, Identity? Target);
+    private sealed record UiSnapshot(bool Running, bool Cancelling, bool FinalSubmitted, int Goal, int Delivered,
+        string RecipientLabel, Identity? Target, uint[] ItemIds, IReadOnlyDictionary<ItemKey, long> Totals, string Status, string DelayLabel, int DelayRemainingMs);
+    private UiSnapshot uiSnapshot = new(false, false, false, 0, 0, "", null, [], new Dictionary<ItemKey, long>(),
+        "请选择物品、品质和总数量，然后选中接收玩家。", "", 0);
     private Config config = null!;
     private Stage stage;
     private ItemKey selected;
     private Identity recipient;
     private Identity sender;
     private int goal, delivered, filling, filled, batchQuantity, activeTimeoutSeconds;
-    private long deadline, nextAction;
-    private bool completionMessage, numericSubmitted, finalSubmitted, settlementWindowStarted, hqWarningSubmitted;
+    private readonly TradeClock clock = new();
+    private int activeBatchCap, activeStackLimit;
+    private TradeDelays activeDelays;
+    private long updateFrame, tradeGeneration, menuGeneration, expectedMenuGeneration, numericMenuGeneration;
+    private nint ownedTradePointer;
+    private long ownedTradeGeneration;
+    private bool ownedTradeClosed;
+    private sealed record CancelRequest(nint TradePointer, long Generation, Identity Sender, Identity Recipient);
+    private CancelRequest? pendingCancel;
+    private bool creatingTradePopup;
+    private long numericBornAt, confirmationBornAt;
+    private nint numericReceiver, confirmationReceiver;
+    private bool numericMappingBound, confirmationMappingBound;
+    private bool completionMessage, numericSubmitted, finalSubmitted, settlementWindowStarted;
     private nint numericPointer, confirmationPointer, contextPointer;
     private ulong numericEventKind, confirmationEventKind;
     private long settlementDecrease;
@@ -81,9 +107,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
         this.data = data;
         this.lifecycle = lifecycle;
         this.log = log;
+        try { gameVersion = data.GameData.Repositories.TryGetValue("ffxiv", out var repository) ? repository.Version?.Trim() : null; }
+        catch { gameVersion = null; }
         config = pluginInterface.GetPluginConfig() as Config ?? new Config();
         config.TotalQuantity = Math.Clamp(config.TotalQuantity, 1, 10_000_000);
         config.TimeoutSeconds = Math.Clamp(config.TimeoutSeconds, 15, 600);
+        config.BatchQuantityCap = Math.Clamp(config.BatchQuantityCap, 1, 999);
+        config.StartupDelayMs = Math.Clamp(config.StartupDelayMs, 0, 600_000);
+        config.BetweenTradesMs = Math.Clamp(config.BetweenTradesMs, 0, 600_000);
         commands.AddHandler("/batchtrade", new CommandInfo(OnCommand) { HelpMessage = "打开批量物品交易设置；/batchtrade stop 停止任务。" });
         pluginInterface.UiBuilder.Draw += Draw;
         pluginInterface.UiBuilder.OpenConfigUi += OpenWindow;
@@ -94,21 +125,38 @@ public sealed unsafe class Plugin : IDalamudPlugin
         lifecycle.RegisterListener(AddonEvent.PreFinalize, "InputNumeric", OnNumericLifecycle);
         lifecycle.RegisterListener(AddonEvent.PostSetup, "SelectYesno", OnConfirmationLifecycle);
         lifecycle.RegisterListener(AddonEvent.PreFinalize, "SelectYesno", OnConfirmationLifecycle);
+        lifecycle.RegisterListener(AddonEvent.PostSetup, "Trade", OnTradeLifecycle);
+        lifecycle.RegisterListener(AddonEvent.PreFinalize, "Trade", OnTradeLifecycle);
+        lifecycle.RegisterListener(AddonEvent.PostSetup, "ContextMenu", OnContextLifecycle);
+        lifecycle.RegisterListener(AddonEvent.PreReceiveEvent, "ContextMenu", OnContextLifecycle);
     }
 
     public void Dispose()
     {
         if (disposed) return;
         disposed = true;
-        Stop("插件已卸载。", true);
-        commands.RemoveHandler("/batchtrade");
-        pluginInterface.UiBuilder.Draw -= Draw;
-        pluginInterface.UiBuilder.OpenConfigUi -= OpenWindow;
-        pluginInterface.UiBuilder.OpenMainUi -= OpenWindow;
-        framework.Update -= Tick;
-        chat.LogMessage -= OnLogMessage;
-        lifecycle.UnregisterListener(OnNumericLifecycle);
-        lifecycle.UnregisterListener(OnConfirmationLifecycle);
+        try
+        {
+            Stop("插件已卸载。", true);
+            ExecutePendingCancel(); // Unloading never bypasses the configured delay or native send limiter.
+            if (pendingCancel != null)
+                log.Warning("BatchTrade unloaded before its safe cancellation time; manually cancel any remaining trade window.");
+        }
+        catch (Exception ex) { log.Error(ex, "BatchTrade unload could not cancel the remaining trade; manual cancellation may be needed."); }
+        finally
+        {
+            pendingCancel = null; clock.CancelPending();
+            commands.RemoveHandler("/batchtrade");
+            pluginInterface.UiBuilder.Draw -= Draw;
+            pluginInterface.UiBuilder.OpenConfigUi -= OpenWindow;
+            pluginInterface.UiBuilder.OpenMainUi -= OpenWindow;
+            framework.Update -= Tick;
+            chat.LogMessage -= OnLogMessage;
+            lifecycle.UnregisterListener(OnNumericLifecycle);
+            lifecycle.UnregisterListener(OnConfirmationLifecycle);
+            lifecycle.UnregisterListener(OnTradeLifecycle);
+            lifecycle.UnregisterListener(OnContextLifecycle);
+        }
     }
 
     private void OnCommand(string command, string arguments)
@@ -133,7 +181,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void QueueStart(UiSnapshot snapshot)
     {
-        var request = new StartRequest(config.ItemId, config.HighQuality, config.TotalQuantity, config.TimeoutSeconds, snapshot.Target);
+        var request = new StartRequest(config.ItemId, config.HighQuality, config.TotalQuantity, config.TimeoutSeconds, config.BatchQuantityCap,
+            new TradeDelays(config.StartupDelayMs, config.RequestDelayMs, config.OpenMenuDelayMs, config.SelectMenuDelayMs,
+                config.QuantityDelayMs, config.CloseMenuDelayMs, config.ProposeDelayMs,
+                config.FinalConfirmDelayMs, config.CancelDelayMs, config.BetweenTradesMs).Normalize(), snapshot.Target);
         var generation = Volatile.Read(ref stopGeneration);
         QueueOnFramework(() =>
         {
@@ -181,7 +232,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private void Draw()
     {
         if (!windowOpen || disposed) return;
-        ImGui.SetNextWindowSize(new Vector2(590, 470), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSize(new Vector2(660, 650), ImGuiCond.FirstUseEver);
         ImGui.SetNextWindowSizeConstraints(new Vector2(420, 340), new Vector2(float.MaxValue, float.MaxValue));
         var open = windowOpen;
         if (ImGui.Begin("批量物品交易###BatchTrade", ref open)) ConfigUI();
@@ -192,7 +243,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private void ConfigUI()
     {
         var snapshot = Volatile.Read(ref uiSnapshot);
-        var pending = Volatile.Read(ref pendingUiActions) != 0;
+        var pending = Volatile.Read(ref pendingUiActions) != 0 || snapshot.Cancelling;
         ImGui.TextWrapped("只发送选中的物品；不接受对方放入的物品或金币。每笔最多 5 格，对方需逐笔手动确认。");
         ImGui.Separator();
         ImGui.BeginDisabled(snapshot.Running || pending);
@@ -214,13 +265,29 @@ public sealed unsafe class Plugin : IDalamudPlugin
         ImGui.InputInt("每笔等待超时（秒）", ref config.TimeoutSeconds);
         if (ImGui.IsItemDeactivatedAfterEdit())
         { config.TimeoutSeconds = Math.Clamp(config.TimeoutSeconds, 15, 600); SaveConfig(); }
+        EditBoundedInt("单笔总数量上限（1–999）", ref config.BatchQuantityCap, 1, 999);
+        ImGui.TextWrapped("上限按整笔所有物品格合计；每笔仍最多 5 个物理格。");
+        if (ImGui.CollapsingHeader("各步骤延迟（毫秒）"))
+        {
+            EditBoundedInt("启动延迟", ref config.StartupDelayMs, 0, 600_000);
+            EditBoundedInt("发起交易前", ref config.RequestDelayMs, 100, 30_000);
+            EditBoundedInt("打开物品菜单前", ref config.OpenMenuDelayMs, 100, 30_000);
+            EditBoundedInt("选择交易菜单项前", ref config.SelectMenuDelayMs, 100, 30_000);
+            EditBoundedInt("提交物品数量前", ref config.QuantityDelayMs, 100, 30_000);
+            EditBoundedInt("关闭自身菜单／下一格前", ref config.CloseMenuDelayMs, 100, 30_000);
+            EditBoundedInt("提出交易条件前", ref config.ProposeDelayMs, 100, 30_000);
+            EditBoundedInt("最终确认交易前", ref config.FinalConfirmDelayMs, 100, 30_000);
+            EditBoundedInt("取消当前交易前", ref config.CancelDelayMs, 100, 30_000);
+            EditBoundedInt("两笔交易间隔", ref config.BetweenTradesMs, 0, 600_000);
+        }
+        ImGui.TextWrapped("每个动作前独立等待，至少间隔 100 毫秒；这些延迟不占用服务器／对方响应超时。停止立即撤销后续动作，取消窗口也遵守发送间隔。");
         var target = snapshot.Target;
         ImGui.TextUnformatted(target is null ? "当前目标：请在游戏中选中一名玩家" : $"当前目标：{target.Value.Name}（世界 #{target.Value.World}）");
         var count = snapshot.Totals.GetValueOrDefault(new(config.ItemId, config.HighQuality));
         ImGui.TextUnformatted($"该品质背包可用数量：{count}");
         if (ImGui.Button("开始批量交易")) QueueStart(snapshot);
         ImGui.EndDisabled();
-        if (snapshot.Running || pending)
+        if (snapshot.Running || pending && !snapshot.Cancelling)
         {
             ImGui.SameLine();
             var stopLabel = !snapshot.Running ? "取消等待中的开始操作" :
@@ -232,13 +299,29 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 ImGui.ProgressBar(snapshot.Goal > 0 ? (float)snapshot.Delivered / snapshot.Goal : 0, new Vector2(-1, 0), $"已完成 {snapshot.Delivered} / {snapshot.Goal}");
             }
         }
-        if (pending) ImGui.TextUnformatted("正在等待游戏线程处理操作……");
+        if (snapshot.DelayRemainingMs > 0) ImGui.TextUnformatted($"{snapshot.DelayLabel}：{snapshot.DelayRemainingMs / 1000.0:F1} 秒");
+        if (snapshot.Cancelling) ImGui.TextUnformatted("已撤销后续操作，等待安全间隔后取消当前交易。");
+        else if (pending) ImGui.TextUnformatted("正在等待游戏线程处理操作……");
         ImGui.TextWrapped(Volatile.Read(ref dispatchError) ?? snapshot.Status);
+    }
+
+    private void EditBoundedInt(string label, ref int value, int minimum, int maximum)
+    {
+        ImGui.InputInt(label, ref value);
+        if (!ImGui.IsItemDeactivatedAfterEdit()) return;
+        value = Math.Clamp(value, minimum, maximum);
+        SaveConfig();
     }
 
     // Only the framework thread reads game state; Draw receives an immutable, atomically published view.
     private void RefreshUiSnapshot()
     {
+        if (!Compatible)
+        {
+            status = $"当前客户端版本 {gameVersion ?? "未知"} 不受支持；本版仅适配 {GameCompatibility.RequiredVersion}，请更新插件后使用。";
+            Volatile.Write(ref uiSnapshot, CreateSnapshot(null, [], new Dictionary<ItemKey, long>()));
+            return;
+        }
         var inventory = ReadInventory();
         var target = CurrentTarget();
         var ids = inventory.Select(x => x.Item.Id).Distinct().Order().ToArray();
@@ -247,8 +330,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
     }
 
     private UiSnapshot CreateSnapshot(Identity? target, uint[] ids, IReadOnlyDictionary<ItemKey, long> totals) =>
-        new(Running, stage == Stage.Settlement, goal, delivered,
-            Running ? $"锁定接收方：{recipient.Name}（世界 #{recipient.World}）" : "", target, ids, totals, status);
+        new(Running, pendingCancel != null, stage == Stage.Settlement, goal, delivered,
+            Running ? $"锁定接收方：{recipient.Name}（世界 #{recipient.World}）" : "", target, ids, totals, status,
+            pendingCancel != null ? "取消交易倒计时" : stage == Stage.Starting ? "启动倒计时" :
+                stage == Stage.BetweenBatches ? "下一笔交易倒计时" : StepName(clock.PendingAction),
+            (Running && stage != Stage.Settlement || pendingCancel != null) ? clock.DelayRemaining(Now) : 0);
 
     private void PublishStateOnly()
     {
@@ -261,7 +347,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void Start(StartRequest request)
     {
-        if (Running) return;
+        if (Running || pendingCancel != null || !Compatible) return;
         if (objects.LocalPlayer is not IPlayerCharacter local || CurrentTarget() is not { } target)
         { status = "请先登录，并选中接收物品的玩家。"; return; }
         if (target != request.Target) { status = "当前目标与点击开始时显示的玩家不同，请核对后重新开始。"; return; }
@@ -277,8 +363,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
         { status = "该品质物品数量不足，请调整总数量或品质。"; return; }
         sender = Describe(local); recipient = target; goal = request.TotalQuantity; delivered = 0;
         activeTimeoutSeconds = Math.Clamp(request.TimeoutSeconds, 15, 600);
+        activeBatchCap = Math.Clamp(request.BatchQuantityCap, 1, 999);
+        activeStackLimit = (int)Math.Clamp((long)item.StackSize, 1, int.MaxValue);
+        activeDelays = request.Delays;
         initialGil = manager->GetGil();
-        PrepareBatch();
+        stage = Stage.Starting;
+        clock.BeginDelay(Now, activeDelays.Startup);
+        status = $"已锁定接收方，启动延迟后开始；单笔总量不超过 {activeBatchCap} 个。";
     }
 
     private bool CheckIdentity()
@@ -298,24 +389,27 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var inventory = ReadInventory();
         if (!TradeRules.SameInventory(baseline, TradeRules.Totals(inventory), selected))
         { Stop("背包在两笔交易之间发生了变化，已停止。", true); return; }
-        batch = TradeRules.Plan(inventory, selected, goal - delivered);
+        batch = TradeRules.Plan(inventory, selected, goal - delivered, activeBatchCap, activeStackLimit);
         if (batch.Count == 0) { Stop("没有足够的可用物品，已停止。", true); return; }
         batchQuantity = batch.Sum(x => x.Quantity); filling = 0; filled = 0;
         completionMessage = finalSubmitted = numericSubmitted = settlementWindowStarted = false;
         settlementDecrease = 0; confirmationPointer = 0;
-        deadline = Now + activeTimeoutSeconds * 1000L;
-        stage = Stage.Requesting;
-        status = $"正在向 {recipient.Name} 发起交易，本笔 {batchQuantity} 个、{batch.Count} 格。";
-        manager->SendTradeRequest(recipient.Entity); // Once only; never resend after timeout.
+        ownedTradePointer = 0; ownedTradeClosed = false;
+        clock.BeginBatch(Now, activeTimeoutSeconds * 1000);
+        stage = Stage.SendingRequest;
+        status = $"准备发起交易，本笔 {batchQuantity} 个、{batch.Count} 格。";
     }
 
     private void Tick(IFramework _)
     {
+        updateFrame++;
         if (disposed || Now < nextTick) return;
+        if (!Compatible) { if (windowOpen) RefreshUiSnapshot(); return; }
         nextTick = Now + 100;
         try
         {
-            if (Running && Now >= nextAction) Advance();
+            if (pendingCancel != null) ExecutePendingCancel();
+            else if (Running) Advance();
             if (windowOpen || Running) RefreshUiSnapshot();
         }
         catch (Exception ex)
@@ -329,19 +423,44 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private void Advance()
     {
         if (!CheckIdentity()) { Stop("目标丢失、距离过远、身份变化或已掉线，已停止。", true); return; }
-        if (Now >= deadline) { Stop("等待超时，已停止。请核对背包后重新开始。", true); return; }
+        if (clock.TimedOut(Now)) { Stop("等待超时，已停止。请核对背包后重新开始。", true); return; }
         var manager = InventoryManager.Instance();
         if (manager == null) { Stop("背包服务不可用，已停止。", false); return; }
         if (manager->GetGil() != initialGil) { Stop("金币发生变化，已停止。", true); return; }
-        if (stage == Stage.BetweenBatches) { PrepareBatch(); return; }
+        if (stage is Stage.Starting or Stage.BetweenBatches)
+        {
+            if (manager->TradeLocalState > TradeState.NotTrading || Visible(Trade) || Visible(SelectYesno) || Visible(InputNumeric) || Visible(ContextAddon))
+            { Stop("等待开始下一笔时出现了其他交易或交互，请核对后重新开始。", false); return; }
+            if (!TradeRules.SameInventory(baseline, TradeRules.Totals(ReadInventory()), selected))
+            { Stop("等待期间背包发生了变化，已停止。", false); return; }
+            if (clock.CanAct(Now)) PrepareBatch();
+            return;
+        }
+        if (stage == Stage.SendingRequest)
+        {
+            if (manager->TradeLocalState > TradeState.NotTrading || Visible(Trade) || Visible(SelectYesno) || Visible(InputNumeric) || Visible(ContextAddon))
+            { Stop("发起交易前出现了其他交互，已停止。", false); return; }
+            if (!TradeRules.SameInventory(baseline, TradeRules.Totals(ReadInventory()), selected))
+            { Stop("发起交易前背包发生了变化，已停止。", false); return; }
+            if (!CanSend(TradeActionKind.Request, activeDelays.Request)) return;
+            stage = Stage.Requesting;
+            status = $"正在向 {recipient.Name} 发起交易，本笔 {batchQuantity} 个、{batch.Count} 格。";
+            manager->SendTradeRequest(recipient.Entity);
+            return;
+        }
         if (stage == Stage.Settlement) { Settle(); return; }
         if (stage == Stage.Requesting)
         {
+            if (!TradeRules.SameInventory(baseline, TradeRules.Totals(ReadInventory()), selected))
+            { Stop("等待接受交易时背包发生了变化，已停止。", true); return; }
             if (!Visible(Trade)) return;
             if (manager->TradePartnerEntityId != recipient.Entity) { Stop("交易对象与锁定玩家不符，已停止。", false); return; }
             if (!OffersMatch(0)) { Stop("交易窗口已有未授权内容，已停止。", true); return; }
+            ownedTradePointer = (nint)Trade; ownedTradeGeneration = tradeGeneration;
             stage = Stage.OpeningMenu;
         }
+        if (ownedTradePointer != 0 && ((nint)Trade != ownedTradePointer || tradeGeneration != ownedTradeGeneration))
+        { Stop("原交易窗口已被替换，已停止；不会操作新窗口。", false); return; }
         if (!Visible(Trade)) { Stop("交易已取消或窗口意外关闭；未计入进度，也不会自动重发。", false); return; }
         if (manager->TradePartnerEntityId != recipient.Entity) { Stop("交易对象发生变化，已停止。", false); return; }
         if (!RemoteEmpty()) { Stop("对方放入了物品或金币，已停止；本任务只支持单向赠送。", true); return; }
@@ -361,7 +480,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 var confirmButton = Trade->GetComponentButtonById(33);
                 if (confirmButton == null || confirmButton->OwnerNode == null) { Stop("当前交易界面缺少预确认按钮，已停止。", true); return; }
                 if (!confirmButton->IsEnabled) return;
-                stage = Stage.AwaitFinal; status = "物品已核对，等待对方确认。"; nextAction = Now + 200;
+                if (!CanSend(TradeActionKind.Propose, activeDelays.Propose)) return;
+                stage = Stage.AwaitFinal; status = "物品已核对，等待对方确认。";
                 confirmationPointer = 0;
                 if (!ClickTradeButton(Trade, confirmButton))
                     Stop("未找到交易按钮唯一有效的本地点击事件，已停止。", true);
@@ -372,14 +492,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 { Stop("交易确认已被撤销，已停止。", true); return; }
                 if (finalSubmitted || !Visible(SelectYesno)) return;
                 if (manager->TradeIsSyncPending || manager->TradeLocalState != TradeState.WaitingForConfirmation) return;
-                // Bind the newly observed popup to this request/phase and exact game-provided text.
-                var finalPrompt = ((AddonSelectYesno*)SelectYesno)->PromptText;
-                if ((nint)SelectYesno != confirmationPointer || finalPrompt == null || finalPrompt->NodeText.ToString() != AddonText(102223) ||
-                    !TryGetTradeCallback(SelectYesno, out var finalKind) || finalKind != confirmationEventKind)
-                { Stop("无法确认弹窗属于当前交易，已停止。请手动核对。", true); return; }
+                if ((nint)SelectYesno != confirmationPointer || !TradeConfirmationTextMatches(SelectYesno, 102223))
+                { Stop("最终确认窗口被替换或提示不匹配，已停止。", true); return; }
+                if (!ConfirmationOwnerReady()) return;
+                if (!CanSend(TradeActionKind.FinalConfirm, activeDelays.FinalConfirm)) return;
                 finalSubmitted = true; stage = Stage.Settlement;
                 SelectYesno->FireCallbackInt(0);
-                status = "已确认本方交易，等待交易完成回执与库存核对。";
+                if (stage == Stage.Settlement) status = "已确认本方交易，等待交易完成回执与库存核对。";
                 break;
         }
     }
@@ -400,7 +519,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var inventoryAgent = agents == null ? null : agents->GetAgentByInternalId(AgentId.Inventory);
         if (context == null || inventoryAgent == null)
         { Stop("背包物品菜单服务不可用，已停止。", true); return; }
-        stage = Stage.SelectingMenu; nextAction = Now + 200;
+        if (!CanSend(TradeActionKind.OpenMenu, activeDelays.OpenMenu)) return;
+        stage = Stage.SelectingMenu;
         context->OpenForItemSlot((InventoryType)planned.Source.Container, planned.Source.Slot, 0, inventoryAgent->AddonId);
     }
 
@@ -418,12 +538,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
             var at = agent->ContexItemStartIndex + i;
             if (at < 0 || at >= agent->EventParams.Length) continue;
             var value = agent->EventParams[at];
-            if (value.Type is not (AtkValueType.String or AtkValueType.ManagedString)) continue;
+            if (value.Type is not (AtkValueType.String or AtkValueType.ManagedString or AtkValueType.ConstString)) continue;
             var label = value.String.ToString().Trim();
             if (label == AddonText(95) && !agent->IsContextItemDisabled(i))
             { if (index != -1) { Stop("存在多个交易菜单项，已停止。", true); return; } index = i; }
         }
         if (index < 0) { Stop("物品菜单没有可用的交易选项，已停止。", true); return; }
+        if (!CanSend(TradeActionKind.SelectMenu, activeDelays.SelectMenu)) return;
         // Existing game's ContextMenu callback contract; no guessed native member function.
         var args = stackalloc AtkValue[5];
         args[0].Type = AtkValueType.Int; args[0].Int = 0;
@@ -431,52 +552,90 @@ public sealed unsafe class Plugin : IDalamudPlugin
         args[2].Type = AtkValueType.UInt; args[2].UInt = 0;
         args[3].Type = AtkValueType.Int; args[3].Int = 0;
         args[4].Type = AtkValueType.Int; args[4].Int = 0;
-        numericSubmitted = false; numericPointer = 0; confirmationPointer = 0; hqWarningSubmitted = false;
+        numericSubmitted = false; numericPointer = 0; confirmationPointer = 0;
         contextPointer = (nint)ContextAddon;
-        stage = Stage.WaitingItem; nextAction = Now + 200;
-        ContextAddon->FireCallback(5, args);
+        expectedMenuGeneration = menuGeneration;
+        numericMappingBound = confirmationMappingBound = false;
+        numericReceiver = confirmationReceiver = 0;
+        stage = Stage.WaitingItem;
+        // PostSetup can run inside this native callback before OpenAddon has registered its receiver.
+        creatingTradePopup = true;
+        try { ContextAddon->FireCallback(5, args); }
+        finally { creatingTradePopup = false; }
     }
 
     private void WaitForItem()
     {
-        var amount = batch[filling].Quantity;
         if (Visible(SelectYesno))
+        { Stop("放入物品时出现了额外确认窗口，已停止；本插件不代确认此提示。", true); return; }
+        var manager = InventoryManager.Instance();
+        var offered = ReadOffer(true);
+        var planned = batch[filling];
+        if (!OfferSourceLinksMatch() || !TradeRules.PendingSlotMatches(offered, batch, filling, selected, manager->TradeItemsLocal[5].Quantity, numericSubmitted))
+        { Stop("待填交易格或此前已填物品格被修改，已停止。", true); return; }
+        // The temporary quantity is 1 even when the planned amount is also 1. A source stack >1
+        // must complete this operation's own numeric callback before that quantity can count as filled.
+        if (planned.Source.Quantity > 1 && !numericSubmitted)
         {
-            if (hqWarningSubmitted) return;
-            if (!selected.HighQuality || (nint)SelectYesno != confirmationPointer ||
-                !TradeConfirmationTextMatches(SelectYesno, 102434) || !TryGetTradeCallback(SelectYesno, out var hqKind) || hqKind != confirmationEventKind ||
-                !(OffersMatch(filled) || OffersMatch(filled + amount)))
-            { Stop("出现了非本任务的HQ交易提示，已停止。", true); return; }
-            hqWarningSubmitted = true;
-            SelectYesno->FireCallbackInt(0);
-            nextAction = Now + 200; return;
+            if (!Visible(InputNumeric)) return;
+            if ((nint)InputNumeric != numericPointer)
+            { Stop("数量窗口被替换：不是本次菜单操作记录的实例，已停止。", true); return; }
+            SubmitQuantity(planned.Quantity);
+            return;
         }
-        if (OffersMatch(filled + amount))
-        {
-            filled += amount; filling++;
-            if (Visible(ContextAddon))
-            {
-                if ((nint)ContextAddon != contextPointer) { Stop("物品菜单被替换，已停止。", true); return; }
-                ContextAddon->Close(false);
-            }
-            stage = filling == batch.Count ? Stage.Ready : Stage.OpeningMenu;
-            status = $"本笔已放入 {filled} / {batchQuantity} 个（{filling} / {batch.Count} 格）。";
-            nextAction = Now + 250; return;
-        }
-        if (!OffersMatch(filled)) { Stop("放入的物品或数量与计划不符，已停止。", true); return; }
-        if (!Visible(InputNumeric)) return;
-        if ((nint)InputNumeric != numericPointer) { Stop("数量弹窗不是本次交易菜单创建的窗口，已停止。", true); return; }
-        if (numericSubmitted) return;
+        if (Visible(InputNumeric)) return;
+        if (!TradeRules.IsSlotComplete(offered, batch, filling, selected, manager->TradeItemsLocal[5].Quantity, numericSubmitted)) return;
+        var closeMenu = Visible(ContextAddon);
+        if (closeMenu && ((nint)ContextAddon != contextPointer || menuGeneration != expectedMenuGeneration))
+        { Stop("物品菜单被替换，已停止。", true); return; }
+        // Consume this step even when the game's menu closes itself during the configured delay.
+        if (!CanSend(TradeActionKind.CloseMenu, activeDelays.CloseMenu)) return;
+        filled += planned.Quantity; filling++;
+        stage = filling == batch.Count ? Stage.Ready : Stage.OpeningMenu;
+        if (closeMenu) ContextAddon->Close(false);
+        if (Running) status = $"本笔已放入 {filled} / {batchQuantity} 个（{filling} / {batch.Count} 格）。";
+    }
+
+    private void SubmitQuantity(int amount)
+    {
         var numeric = InputNumeric;
         var agent = AgentInventoryContext.Instance();
+        var manager = InventoryManager.Instance();
         var planned = batch[filling];
-        if (agent == null || agent->TargetInventoryId != (InventoryType)planned.Source.Container || agent->TargetInventorySlotId != planned.Source.Slot ||
-            numeric->AtkValues == null || numeric->AtkValuesCount < 7 || numeric->AtkValues[2].Type != AtkValueType.UInt || numeric->AtkValues[3].Type != AtkValueType.UInt ||
-            numeric->AtkValues[2].UInt > amount || numeric->AtkValues[3].UInt != planned.Source.Quantity || !IsTradeQuantityPrompt(numeric) ||
-            !TryGetTradeCallback(numeric, out var currentKind) || currentKind != numericEventKind)
-        { Stop("数量弹窗与当前物品格不匹配，已停止。", true); return; }
-        numericPointer = (nint)numeric; numericSubmitted = true;
-        numeric->FireCallbackInt(amount); nextAction = Now + 250;
+        var source = manager->GetInventorySlot((InventoryType)planned.Source.Container, planned.Source.Slot);
+        var sourceMatches = agent != null && agent->TargetInventoryId == (InventoryType)planned.Source.Container &&
+            agent->TargetInventorySlotId == planned.Source.Slot && source != null && Key(source) == selected && source->Quantity == planned.Source.Quantity;
+        var owner = ReadPopupCallback(numeric, out var receiver, out var kind);
+        if (owner == PopupOwner.Missing && Now - numericBornAt < 2_000) return;
+        if (!TryNumericRange(numeric, out var minimum, out var maximum))
+        { Stop("数量窗口范围类型不匹配：需要有效的整数 min/max，已停止。", true); return; }
+        var evidence = new NumericPopupState(numericMenuGeneration == expectedMenuGeneration && menuGeneration == expectedMenuGeneration,
+            sourceMatches, Visible(Trade) && manager->TradePartnerEntityId == recipient.Entity && manager->TradeLocalState == TradeState.SelectingTradeGoods,
+            owner, !numericMappingBound || receiver == numericReceiver && kind == numericEventKind,
+            IsTradeQuantityPrompt(numeric), minimum, maximum, amount, planned.Source.Quantity, activeStackLimit, activeBatchCap - filled);
+        var result = NumericPopupRules.Check(evidence);
+        if (result != NumericCheck.Ready)
+        {
+            var detail = result switch
+            {
+                NumericCheck.ActionNotBound => "菜单操作代次已经变化",
+                NumericCheck.SourceChanged => "源物品格已经变化",
+                NumericCheck.TradeChanged => "交易对象或交易状态已经变化",
+                NumericCheck.OwnerMissing => "回调接收者在初始化等待后仍未登记",
+                NumericCheck.OwnerUnexpected => "回调接收者或事件种类不属于此版本的交易数量处理器",
+                NumericCheck.MappingChanged => "回调接收者或事件种类被替换",
+                NumericCheck.PromptMismatch => "提示文本不是游戏提供的交易数量提示",
+                _ => $"范围不匹配（最小 {minimum}，最大 {maximum}，计划 {amount}，物品堆叠 {activeStackLimit}）"
+            };
+            Stop($"数量窗口校验失败：{detail}，已停止。", true);
+            return;
+        }
+        numericReceiver = receiver; numericEventKind = kind; numericMappingBound = true;
+        if (!CanSend(TradeActionKind.Quantity, activeDelays.Quantity)) return;
+        numericSubmitted = true;
+        creatingTradePopup = true;
+        try { numeric->FireCallbackInt(amount); }
+        finally { creatingTradePopup = false; }
     }
 
     private void OnLogMessage(ILogMessage message)
@@ -504,7 +663,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         { Stop("结算期间出现了其他交易，已停止；不会关闭该窗口。", false); return; }
         if (Visible(Trade) && !OffersMatch(batchQuantity) && change == InventoryChange.Unchanged)
         { Stop("结算前交易内容发生变化，已停止。", true); return; }
-        var ended = !Visible(Trade) || manager->TradeLocalState <= TradeState.NotTrading;
+        var ended = ownedTradeClosed || !Visible(Trade) || manager->TradeLocalState <= TradeState.NotTrading;
         if (change != InventoryChange.Unchanged || ended) StartSettlementWindow();
         var result = CompletionGate.Evaluate(completionMessage, change, ended);
         if (result == CompletionResult.Invalid)
@@ -512,7 +671,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (result != CompletionResult.Complete) return;
         delivered += batchQuantity; baseline = current;
         if (delivered == goal) { stage = Stage.Idle; status = $"批量交易已完成：{delivered} 个 {ItemName(selected.Id)} {(selected.HighQuality ? "HQ" : "NQ")}。"; return; }
-        stage = Stage.BetweenBatches; nextAction = Now + 700; deadline = Now + 10_000;
+        stage = Stage.BetweenBatches;
+        clock.BeginDelay(Now, activeDelays.BetweenTrades);
         status = $"已完成 {delivered} / {goal} 个，准备下一笔。";
     }
 
@@ -520,29 +680,56 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         if (settlementWindowStarted) return;
         settlementWindowStarted = true;
-        deadline = Math.Min(deadline, Now + 5_000);
+        clock.LimitSettlement(Now, 5_000);
     }
 
-    private string AddonText(uint row) => data.GetExcelSheet<Addon>()?.GetRowOrDefault(row)?.Text.ToString() ?? string.Empty;
+    private string AddonText(uint row) => data.GetExcelSheet<Addon>()?.GetRowOrDefault(row)?.Text.ExtractText().Trim() ?? string.Empty;
+    private static string PlainText(byte* text) => text == null ? string.Empty : SeString.Parse(text).TextValue.Trim();
     private bool IsTradeQuantityPrompt(AtkUnitBase* addon) =>
         addon != null && addon->AtkValues != null && addon->AtkValuesCount > 6 &&
-        addon->AtkValues[6].Type is AtkValueType.String or AtkValueType.ManagedString &&
-        addon->AtkValues[6].String.ToString() == AddonText(206);
+        addon->AtkValues[6].Type is AtkValueType.String or AtkValueType.ManagedString or AtkValueType.ConstString &&
+        PlainText(addon->AtkValues[6].String) == AddonText(206);
 
     private bool TradeConfirmationTextMatches(AtkUnitBase* addon, uint row) => addon != null &&
-        ((AddonSelectYesno*)addon)->PromptText != null && ((AddonSelectYesno*)addon)->PromptText->NodeText.ToString() == AddonText(row);
+        ((AddonSelectYesno*)addon)->PromptText != null && PlainText(((AddonSelectYesno*)addon)->PromptText->NodeText.StringPtr) == AddonText(row);
 
-    // Read the game's actual callback receiver. A numeric/YesNo dialog owned by InventoryContext,
-    // Shop or another agent must never be submitted even if it reuses the same prompt/pointer.
-    // Source: pinned CN FFXIVClientStructs AtkModule.AddonCallbackMapping / AddonCallbackEntry.
-    private static bool TryGetTradeCallback(AtkUnitBase* addon, out ulong eventKind)
+    private static bool TryNumericRange(AtkUnitBase* addon, out int minimum, out int maximum)
     {
-        eventKind = 0;
+        minimum = maximum = -1;
+        if (addon == null || addon->AtkValues == null || addon->AtkValuesCount < 4) return false;
+        static int Read(AtkValue value) => value.Type switch
+        {
+            AtkValueType.UInt when value.UInt <= int.MaxValue => (int)value.UInt,
+            AtkValueType.Int when value.Int >= 0 => value.Int,
+            _ => -1
+        };
+        minimum = Read(addon->AtkValues[2]); maximum = Read(addon->AtkValues[3]);
+        return minimum >= 0 && maximum >= minimum;
+    }
+
+    // PostSetup can precede registration in AddonCallbackMapping. Resolve on a later framework tick.
+    // Only version-pinned InventoryManager embedded receivers are accepted; arbitrary agents are rejected.
+    private static PopupOwner ReadPopupCallback(AtkUnitBase* addon, out nint receiver, out ulong eventKind)
+    {
+        receiver = 0; eventKind = 0;
         var module = RaptureAtkModule.Instance();
-        var agent = AgentTrade.Instance();
-        if (addon == null || module == null || agent == null ||
-            !module->AddonCallbackMapping.TryGetValue(addon->Id, out var entry, false) || entry.AgentInterface != (AgentInterface*)agent) return false;
-        eventKind = entry.EventKind;
+        if (addon == null || module == null || !module->AddonCallbackMapping.TryGetValue(addon->Id, out var entry, false)) return PopupOwner.Missing;
+        receiver = (nint)entry.AgentInterface; eventKind = entry.EventKind;
+        if (receiver == 0) return PopupOwner.Missing;
+        var inventory = (nint)InventoryManager.Instance();
+        if (GameCompatibility.IsQuantityReceiver(inventory, receiver, eventKind)) return PopupOwner.InventoryQuantity;
+        return GameCompatibility.IsFinalReceiver(inventory, receiver, eventKind) ? PopupOwner.InventoryFinal : PopupOwner.Other;
+    }
+
+    private bool ConfirmationOwnerReady()
+    {
+        var owner = ReadPopupCallback(SelectYesno, out var receiver, out var kind);
+        if (owner == PopupOwner.Missing && Now - confirmationBornAt < 2_000) return false;
+        if (owner != PopupOwner.InventoryFinal)
+        { Stop($"确认窗口归属不匹配（{owner}），已停止。", true); return false; }
+        if (confirmationMappingBound && (receiver != confirmationReceiver || kind != confirmationEventKind))
+        { Stop("确认窗口回调在等待期间被替换，已停止。", true); return false; }
+        confirmationReceiver = receiver; confirmationEventKind = kind; confirmationMappingBound = true;
         return true;
     }
 
@@ -553,16 +740,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (type == AddonEvent.PreFinalize)
         {
             if ((nint)addon == confirmationPointer &&
-                (stage == Stage.AwaitFinal && !finalSubmitted || stage == Stage.WaitingItem && !hqWarningSubmitted))
-                Stop("交易确认弹窗被取消，已停止。", true);
+                stage == Stage.AwaitFinal && !finalSubmitted)
+                Stop("交易确认窗口被取消，已停止。", true);
             return;
         }
-        var expected = stage == Stage.AwaitFinal ? 102223u : stage == Stage.WaitingItem && selected.HighQuality ? 102434u : 0u;
-        if (expected == 0 || confirmationPointer != 0 || !TradeConfirmationTextMatches(addon, expected) ||
-            !TryGetTradeCallback(addon, out var kind))
-        { Stop("出现了非预期或被替换的确认弹窗，已停止。", true); return; }
-        confirmationPointer = (nint)addon;
-        confirmationEventKind = kind;
+        var expected = stage == Stage.AwaitFinal ? 102223u : 0u;
+        if (expected == 0 || confirmationPointer != 0)
+        { Stop("确认窗口在非预期阶段出现或被替换，已停止。", true); return; }
+        confirmationPointer = (nint)addon; confirmationBornAt = Now;
+        confirmationMappingBound = false;
     }
 
     private void OnNumericLifecycle(AddonEvent type, AddonArgs args)
@@ -572,25 +758,93 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (type == AddonEvent.PreFinalize)
         {
             if ((nint)addon == numericPointer && !numericSubmitted)
-                Stop("交易数量弹窗被取消，已停止。", true);
+                Stop("交易数量窗口被取消，已停止。", true);
             return;
         }
-        if (numericPointer != 0 || numericSubmitted || !IsTradeQuantityPrompt(addon) || !TryGetTradeCallback(addon, out var kind))
-        { Stop("出现了非预期或替换的数量弹窗，已停止。", true); return; }
-        numericPointer = (nint)addon;
-        numericEventKind = kind;
+        // Loading may complete on a later frame, so the native callback's synchronous scope is not required.
+        if (numericPointer != 0 || numericSubmitted || contextPointer == 0 || menuGeneration != expectedMenuGeneration)
+        { Stop("数量窗口被替换或菜单操作代次已变化，已停止。", true); return; }
+        numericPointer = (nint)addon; numericBornAt = Now;
+        numericMenuGeneration = expectedMenuGeneration; numericMappingBound = false;
     }
+
+    private void OnTradeLifecycle(AddonEvent type, AddonArgs args)
+    {
+        var previousGeneration = tradeGeneration++;
+        if (!Running) return;
+        if (type == AddonEvent.PostSetup && ownedTradePointer != 0)
+        { Stop("原交易后出现了新的交易窗口，已停止；不会操作新窗口。", false); return; }
+        if (type != AddonEvent.PreFinalize) return;
+        if (ownedTradePointer != 0 && (nint)args.GetAddonPointer<AtkUnitBase>() == ownedTradePointer && ownedTradeGeneration == previousGeneration)
+        {
+            ownedTradeClosed = true;
+            if (stage != Stage.Settlement) Stop("本次交易窗口被关闭，已停止。", false);
+        }
+        else if (stage == Stage.Requesting) Stop("正在等待的交易窗口已关闭，已停止。", false);
+    }
+
+    private void OnContextLifecycle(AddonEvent type, AddonArgs args)
+    {
+        if (type == AddonEvent.PostSetup)
+        {
+            menuGeneration++;
+            if (stage is Stage.WaitingItem or Stage.Ready or Stage.AwaitFinal)
+                Stop("等待交易期间打开了新的物品菜单，已停止。", true);
+            return;
+        }
+        if (stage == Stage.WaitingItem && !creatingTradePopup && args is AddonReceiveEventArgs receive &&
+            (AtkEventType)receive.AtkEventType is AtkEventType.ListItemClick or AtkEventType.ButtonClick or AtkEventType.MouseClick)
+            Stop("本次交易菜单又收到其他点击，已停止。", true);
+    }
+
+    private bool CanSend(TradeActionKind action, int delay)
+    {
+        clock.Schedule(action, Now, delay);
+        return clock.TryDispatch(action, Now, updateFrame);
+    }
+
+    private static string StepName(TradeActionKind? step) => step switch
+    {
+        TradeActionKind.Request => "发起交易倒计时", TradeActionKind.OpenMenu => "打开物品菜单倒计时",
+        TradeActionKind.SelectMenu => "选择交易菜单项倒计时", TradeActionKind.Quantity => "提交数量倒计时",
+        TradeActionKind.CloseMenu => "关闭菜单倒计时",
+        TradeActionKind.Propose => "提出交易条件倒计时", TradeActionKind.FinalConfirm => "最终确认倒计时",
+        TradeActionKind.Cancel => "取消交易倒计时", _ => "操作倒计时"
+    };
 
     private void Stop(string reason, bool cancelOwnTrade)
     {
         var previousStage = stage;
         var wasRunning = Running; stage = Stage.Idle;
-        // After final submission, an asynchronously appearing Trade may already be another request,
-        // even when its recipient is the same. Never close/cancel windows during reconciliation.
-        if (cancelOwnTrade && wasRunning && previousStage is not (Stage.Settlement or Stage.BetweenBatches) &&
+        if (!wasRunning && pendingCancel != null) return; // Repeated Stop never restarts the cancellation timer.
+        clock.CancelPending();
+        if (cancelOwnTrade && wasRunning && previousStage is not (Stage.Starting or Stage.SendingRequest or Stage.Settlement or Stage.BetweenBatches) &&
+            ownedTradePointer != 0 && (nint)Trade == ownedTradePointer && ownedTradeGeneration == tradeGeneration &&
             InventoryManager.Instance() is var m && m != null && m->TradePartnerEntityId == recipient.Entity && Visible(Trade))
-            CancelTrade(Trade);
+        {
+            pendingCancel = new(ownedTradePointer, ownedTradeGeneration, sender, recipient);
+            clock.Schedule(TradeActionKind.Cancel, Now, activeDelays.Cancel);
+        }
         status = reason + (goal > 0 ? $" 已确认完成 {delivered} / {goal} 个。" : "");
+    }
+
+    private void ExecutePendingCancel()
+    {
+        if (pendingCancel is not { } pending) return;
+        var manager = InventoryManager.Instance();
+        if (framework.IsFrameworkUnloading || !framework.IsInFrameworkUpdateThread ||
+            pending.Generation != tradeGeneration || (nint)Trade != pending.TradePointer || !Visible(Trade) || manager == null ||
+            manager->TradePartnerEntityId != pending.Recipient.Entity || manager->TradeLocalState <= TradeState.NotTrading || manager->TradeLocalState >= TradeState.Confirmed ||
+            objects.LocalPlayer is not IPlayerCharacter local || Describe(local) != pending.Sender ||
+            objects.SearchByEntityId(pending.Recipient.Entity) is not IPlayerCharacter other || Describe(other) != pending.Recipient)
+        {
+            pendingCancel = null; clock.CancelPending();
+            return;
+        }
+        if (!clock.TryDispatch(TradeActionKind.Cancel, Now, updateFrame)) return;
+        pendingCancel = null; clock.CancelPending(); // Clear before the native callback can re-enter lifecycle handlers.
+        CancelTrade(Trade);
+        status += " 已发送取消请求。";
     }
 
     private static AtkUnitBase* GetAddon(string name)
@@ -652,17 +906,44 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private bool OffersMatch(int expected)
     {
         var manager = InventoryManager.Instance();
-        return manager != null && RemoteEmpty() && TradeRules.ValidOffer(ReadOffer(true), selected, expected, manager->TradeItemsLocal[5].Quantity);
+        return manager != null && RemoteEmpty() && OfferSourceLinksMatch() && TradeRules.ValidOffer(ReadOffer(true), selected, expected, manager->TradeItemsLocal[5].Quantity);
+    }
+    private bool OfferSourceLinksMatch()
+    {
+        var manager = InventoryManager.Instance();
+        if (manager == null) return false;
+        fixed (InventoryItem* first = manager->TradeItemsLocal)
+        {
+            for (var i = 0; i < 5; i++)
+            {
+                var offered = first + i;
+                if (offered->Quantity == 0) continue;
+                if (i >= batch.Count || !offered->IsSymbolic) return false;
+                var source = batch[i].Source;
+                if ((InventoryType)offered->LinkedInventoryType != (InventoryType)source.Container || offered->LinkedItemSlot != source.Slot) return false;
+                var actual = manager->GetInventorySlot((InventoryType)source.Container, source.Slot);
+                if (actual == null || Key(actual) != source.Item || actual->Quantity != source.Quantity) return false;
+            }
+        }
+        return true;
     }
     private static ItemKey Key(InventoryItem* item) => new(item->ItemId, (item->Flags & InventoryItem.ItemFlags.HighQuality) != 0);
     private static List<BagSlot> ReadOffer(bool local)
     {
         var manager = InventoryManager.Instance(); var result = new List<BagSlot>(5);
         if (manager == null) return result;
-        for (var i = 0; i < 5; i++)
+        var offer = local ? manager->TradeItemsLocal : manager->TradeItemsRemote;
+        fixed (InventoryItem* first = offer)
         {
-            var item = local ? manager->TradeItemsLocal[i] : manager->TradeItemsRemote[i];
-            result.Add(new(0, i, new(item.ItemId, (item.Flags & InventoryItem.ItemFlags.HighQuality) != 0), item.Quantity));
+            for (var i = 0; i < 5; i++)
+            {
+                var item = first + i;
+                // Local Trade items are symbolic links. Their raw ItemId/Flags are not the offered item.
+                // Resolve identity through official getters on the ORIGINAL native slot, never a struct copy.
+                // Quantity remains this Trade slot's selected amount (initially 1), not the source stack size.
+                var key = new ItemKey(item->GetBaseItemId(), (item->GetFlags() & InventoryItem.ItemFlags.HighQuality) != 0);
+                result.Add(new(0, i, key, item->Quantity));
+            }
         }
         return result;
     }
