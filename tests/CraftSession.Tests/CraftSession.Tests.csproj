@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../plugins/RetainerCraftBridge/CraftContracts.cs" Link="CraftContracts.cs" />
+    <Compile Include="../../plugins/RetainerCraftBridge/CraftRules.cs" Link="CraftRules.cs" />
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+</Project>

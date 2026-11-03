@@ -339,4 +339,42 @@ Check(TradeOfferRules.Check(crossBagView, crossBagPlan, 2, true).Code == OfferCh
 crossBagView.RawWorking[2] = crossBagView.RawWorking[2] with { LinkedContainer = 0, LinkedSlot = 2 };
 Check(TradeOfferRules.Check(crossBagView, crossBagPlan, 2, true).Code == OfferCheckCode.SourceContainer,
     "using target trade index as a source bag slot still fails source authority check");
+// Final confirmation may be completed or dismissed outside this plugin; observation never sends a replacement click.
+Check(TradeRules.CanReconcileFinal(true, true, true, 5, 5, 4995, 4995), "verified five-slot final phase permits read-only observation");
+Check(!TradeRules.CanReconcileFinal(false, true, true, 5, 5, 4995, 4995), "user stop or another phase cannot restart reconciliation");
+Check(!TradeRules.CanReconcileFinal(true, false, true, 5, 5, 4995, 4995), "unverified final offer cannot enter observation as an authorized batch");
+Check(!TradeRules.CanReconcileFinal(true, true, false, 5, 5, 4995, 4995), "unknown trade lifecycle cannot be reconciled");
+Check(!TradeRules.CanReconcileFinal(true, true, true, 4, 5, 3996, 4995), "partial filling cannot qualify as a completed offer");
+Check(!TradeRules.CanReconcileFinal(true, true, true, 5, 5, 4994, 4995), "filled quantity must equal exact planned quantity");
+Check(!TradeRules.CanReconcileFinal(true, true, true, 0, 0, 0, 0), "empty offer cannot arm final observation");
+var reconciliationClock = new TradeClock();
+reconciliationClock.BeginBatch(0, 90000);
+reconciliationClock.Schedule(TradeActionKind.FinalConfirm, 0, 30000);
+reconciliationClock.BeginBatch(500, 5000); // Production BeginReadOnlySettlement replaces the pending action budget.
+Check(!reconciliationClock.TryDispatch(TradeActionKind.FinalConfirm, 30000, 1) && reconciliationClock.PendingAction == null,
+    "popup closure cancels pending final click even after its former delay expires");
+Check(!reconciliationClock.TimedOut(5499) && reconciliationClock.TimedOut(5500), "read-only reconciliation is bounded to five seconds");
+Check(CompletionGate.Evaluate(false, InventoryChange.Unchanged, true) == CompletionResult.Waiting,
+    "closed confirmation and trade without receipt or inventory never counts as completed");
+Check(CompletionGate.Evaluate(true, InventoryChange.PartialExpectedDecrease, true) == CompletionResult.Waiting,
+    "external confirmation with only partial inventory decrease still waits");
+Check(CompletionGate.Evaluate(false, InventoryChange.ExpectedDecrease, true) == CompletionResult.Waiting,
+    "external inventory change plus close still requires the send receipt");
+Check(CompletionGate.Evaluate(true, InventoryChange.ExpectedDecrease, true) == CompletionResult.Complete,
+    "all three proofs permit completion without requiring this plugin to own the final click");
+Check(CompletionGate.Evaluate(true, InventoryChange.Unexpected, true) == CompletionResult.Invalid,
+    "external final path never accepts unrelated inventory change");
+const string finalText = "以该条件进行交易吗？";
+Check(FinalPromptRules.Check(finalText, true, finalText) == FinalPromptCheck.Ready,
+    "verified native prompt authorizes text gate independently of rendered node decoration");
+Check(FinalPromptRules.Check("  " + finalText + "\r\n", true, finalText) == FinalPromptCheck.Ready,
+    "native string prompt normalizes surrounding whitespace only");
+Check(FinalPromptRules.Check("其他确认", true, finalText) == FinalPromptCheck.TextMismatch,
+    "unknown native prompt remains blocked even if a rendered node would match");
+Check(FinalPromptRules.Check(finalText, false, finalText) == FinalPromptCheck.UnsupportedType,
+    "nonstring native value cannot be treated as a matching prompt");
+Check(FinalPromptRules.Check(null, false, finalText) == FinalPromptCheck.ValueUnavailable,
+    "missing native values remain a distinct initialization state");
+Check(FinalPromptRules.Check("", true, "") == FinalPromptCheck.ExpectedTextMissing,
+    "missing sheet text cannot authorize empty native prompt");
 Console.WriteLine($"PASS {checks} checks");

@@ -17,5 +17,9 @@ try {
         & $Dotnet run --project "tests/$name.Tests/$name.Tests.csproj" -c Release
         if ($LASTEXITCODE -ne 0) { throw "Tests failed: $name" }
     }
+    foreach ($name in @('MaterialRestock', 'CraftSession')) {
+        & $Dotnet run --project "tests/$name.Tests/$name.Tests.csproj" -c Release
+        if ($LASTEXITCODE -ne 0) { throw "Tests failed: $name" }
+    }
 }
 finally { Pop-Location }

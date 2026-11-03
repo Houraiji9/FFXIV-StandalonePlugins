@@ -12,6 +12,20 @@ public enum InventoryChange { Unchanged, PartialExpectedDecrease, ExpectedDecrea
 public enum CompletionResult { Waiting, Complete, Invalid }
 public enum PopupOwner { Missing, InventoryQuantity, InventoryFinal, Other }
 public enum NumericCheck { Ready, ActionNotBound, SourceChanged, TradeChanged, OwnerMissing, OwnerUnexpected, MappingChanged, PromptMismatch, InvalidRange }
+public enum FinalPromptCheck { Ready, ExpectedTextMissing, ValueUnavailable, UnsupportedType, TextMismatch }
+
+public static class FinalPromptRules
+{
+    // The native SelectYesno input is authoritative; rendered node text may be decorated or updated separately.
+    public static FinalPromptCheck Check(string? valueText, bool supportedStringType, string expectedText)
+    {
+        if (string.IsNullOrWhiteSpace(expectedText)) return FinalPromptCheck.ExpectedTextMissing;
+        if (valueText == null) return FinalPromptCheck.ValueUnavailable;
+        if (!supportedStringType) return FinalPromptCheck.UnsupportedType;
+        return string.Equals(valueText.Trim(), expectedText.Trim(), StringComparison.Ordinal)
+            ? FinalPromptCheck.Ready : FinalPromptCheck.TextMismatch;
+    }
+}
 
 public readonly record struct NumericPopupState(bool ActionBound, bool SourceMatches, bool TradeMatches,
     PopupOwner Owner, bool MappingUnchanged, bool PromptMatches, int Minimum, int Maximum,
@@ -116,6 +130,12 @@ public static class TradeRules
 {
     public static int MigrateSlotQuantityCap(int configVersion, int slotQuantityCap, int legacyBatchQuantityCap) =>
         Math.Clamp(configVersion < 3 ? legacyBatchQuantityCap : slotQuantityCap, 1, 999);
+
+    // This permits observation only, never a native send or a retry. Completion still requires all three signals.
+    public static bool CanReconcileFinal(bool awaitingFinal, bool offerVerified, bool originalTradeKnown,
+        int filledSlots, int plannedSlots, int filledQuantity, int plannedQuantity) =>
+        awaitingFinal && offerVerified && originalTradeKnown && plannedSlots is >= 1 and <= 5 &&
+        filledSlots == plannedSlots && plannedQuantity > 0 && filledQuantity == plannedQuantity;
 
     public static bool PendingSlotMatches(IReadOnlyList<BagSlot> offered, IReadOnlyList<PlannedSlot> plan,
         int filling, ItemKey selected, int gil, bool quantitySubmitted)

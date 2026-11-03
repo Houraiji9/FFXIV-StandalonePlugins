@@ -45,6 +45,7 @@ void Submit(BridgeMachine m, FakeHost h)
 }
 void StartCraft(BridgeMachine m, FakeHost h)
 {
+    h.PendingCraftQueued = false; h.ArtisanEndurance = true;
     h.ActualCraftActive = true; h.SafeCraftBoundary = false; h.UiReleased = false;
     m.Tick();
 }
@@ -175,7 +176,129 @@ lmh.HeadReady = true; lateMode.Tick(); lmh.ActualCraftActive = false; lmh.SafeCr
 lmh.ArtisanEndurance = true; lateMode.Tick();
 Check(lateMode.State == BridgeState.Failed && lmh.Enables == 1 && lmh.EnduranceStops == 1, "Endurance restarting after stop fails without another stop or AR resume");
 
+(BridgeMachine M, FakeHost H, FakeMaterials Materials) Preparing()
+{
+    var host = new FakeHost(); host.Add(1); host.Add(9);
+    var materials = new FakeMaterials();
+    var machine = new BridgeMachine(host, materials);
+    machine.Start(new(new(1, "First", "World"), new(9, "Crafter", "World")), 123, 7, true);
+    machine.Tick(); Arrive(machine, host); Boundary(machine, host); Submit(machine, host);
+    return (machine, host, materials);
+}
+var (prep, preph, prepService) = Preparing();
+Check(prep.State == BridgeState.PreparingMaterials && prepService.Begins == 1 && preph.Crafts == 0
+    && prepService.Request == (123, 7, 9UL), "Materials are prepared once for the frozen recipe/count/crafter before CraftItem");
+prep.Tick(); prep.Tick();
+Check(preph.Crafts == 0 && prepService.Begins == 1, "Pending material withdrawal cannot enqueue crafting or duplicate preparation");
+prepService.State = MaterialPreparationState.Completed; prepService.Blocking = true; prep.Tick();
+Check(preph.Crafts == 0, "Material quantities alone cannot bypass an outstanding owned UI/transfer");
+prepService.Blocking = false; preph.UiReleased = false; prep.Tick(); preph.Now += 1500; prep.Tick();
+Check(preph.Crafts == 0, "Completed material job still requires released retainer UI");
+preph.UiReleased = true; prep.Tick(); preph.Now += 1100; prep.Tick();
+Check(preph.Crafts == 1 && prep.State == BridgeState.CraftPending, "Verified material preparation and stable idle permit one craft submission");
+
+var (prepDue, pdh, pds) = Preparing();
+pdh.HeadReady = true; prepDue.Tick(); prepDue.Tick();
+Check(prepDue.State == BridgeState.StoppingMaterials && pds.Cancels == 1 && pdh.Crafts == 0 && pdh.Enables == 1,
+    "Head due during materials cancels once and waits without crafting or resuming AR");
+pds.State = MaterialPreparationState.Cancelled; pds.Blocking = false; pdh.UiReleased = false; prepDue.Tick();
+Check(prepDue.State == BridgeState.StoppingMaterials, "Cancelled material queue with open UI cannot hand control to AR");
+pdh.UiReleased = true; prepDue.Tick(); pdh.Now += 1100; prepDue.Tick();
+Check(prepDue.State == BridgeState.StartingCycle && pdh.Crafts == 0, "Cancelled material preparation returns to head only after stable cleanup");
+
+var (prepCancel, pch, pcs) = Preparing(); prepCancel.Cancel(); prepCancel.Tick();
+Check(prepCancel.Blocking && pcs.Cancels == 1 && pch.Crafts == 0 && pch.Enables == 1,
+    "User stop during withdrawal retains cleanup ownership without restarting AR");
+pcs.State = MaterialPreparationState.Cancelled; pcs.Blocking = false; prepCancel.Tick(); pch.Now += 2100; prepCancel.Tick();
+Check(!prepCancel.Blocking && prepCancel.State == BridgeState.Cancelled && pch.Enables == 1,
+    "User-cancelled material cleanup ends without restarting the loop");
+
+var (prepFail, pfh, pfs) = Preparing(); pfs.State = MaterialPreparationState.Failed; prepFail.Tick(); prepFail.Tick();
+Check(prepFail.State == BridgeState.Failed && prepFail.Blocking && pfh.Crafts == 0 && pfh.Enables == 1,
+    "Failed withdrawal never crafts or releases unresolved material work");
+var (prepWrong, pwh, pws) = Preparing(); pwh.CurrentCid = 2; prepWrong.Tick();
+Check(prepWrong.State == BridgeState.Failed && pws.Cancels == 1 && pwh.Crafts == 0,
+    "Character change during material preparation cancels without touching the next craft");
+var (prepTimeout, pth, pts) = Preparing(); pth.Now += 600001; prepTimeout.Tick();
+Check(prepTimeout.State == BridgeState.Failed && pts.Cancels == 1 && pth.Crafts == 0,
+    "Material preparation timeout begins cleanup without queueing Artisan");
+var (prepUnload, puh, pus) = Preparing(); var prepUnloadWarning = prepUnload.DisposeStop();
+Check(prepUnloadWarning?.Contains("material preparation") == true && pus.Disposed && puh.Crafts == 0 && puh.Enables == 1,
+    "Unload with outstanding materials warns and keeps AR disabled");
+var (prepCancelThrow, pcth, pcts) = Preparing(); pcts.ThrowCancel = true;
+var ticksBeforeCancel = pcts.Ticks;
+prepCancelThrow.Cancel(); prepCancelThrow.Tick(); prepCancelThrow.Tick();
+Check(pcts.Ticks == ticksBeforeCancel && prepCancelThrow.Blocking && pcth.Crafts == 0,
+    "A failing material cancellation cannot tick a still-running withdrawal service");
+pcts.ThrowCancel = false; prepCancelThrow.Tick();
+Check(pcts.State == MaterialPreparationState.Cancelling && pcts.Ticks == ticksBeforeCancel + 1,
+    "Cleanup resumes material ticking only after cancellation has actually taken effect");
+
+var (acceptedPending, aph) = Begin(); Arrive(acceptedPending, aph); Boundary(acceptedPending, aph); Submit(acceptedPending, aph);
+aph.PendingCraftQueued = false; aph.ArtisanEndurance = true; aph.UiReleased = false;
+acceptedPending.Cancel(); acceptedPending.Tick();
+Check(aph.EnduranceStops == 1 && !aph.ArtisanEndurance && aph.Crafts == 1,
+    "Cancel stops accepted Endurance before the first actual craft instead of waiting forever");
+aph.Now += 2100; acceptedPending.Tick(); aph.Now += 2100; acceptedPending.Tick();
+Check(!acceptedPending.Blocking && aph.Enables == 1,
+    "Accepted but never-started crafting drains to a stopped usable plugin without resuming AR");
+
+var (clearedPending, clph) = Begin(); Arrive(clearedPending, clph); Boundary(clearedPending, clph); Submit(clearedPending, clph);
+clearedPending.Cancel(); clearedPending.Tick();
+Check(clearedPending.Blocking && clph.EnduranceStops == 0, "Busy private activation still prevents premature cancellation success");
+clph.PendingCraftQueued = false; clearedPending.Tick(); clph.Now += 2100; clearedPending.Tick(); clph.Now += 2100; clearedPending.Tick();
+Check(clearedPending.Blocking && !clph.ActualCraftActive && clph.Enables == 1 && clph.EnduranceStops == 0,
+    "Legacy IsBusy=false cannot prove its unobserved PreCrafting tasks have been cleared");
+
+var (quickStop, qsh) = Begin(); Arrive(quickStop, qsh); Boundary(quickStop, qsh); Submit(quickStop, qsh);
+qsh.QuickActive = true; StartCraft(quickStop, qsh); quickStop.Cancel(); quickStop.Tick(); quickStop.Tick();
+Check(qsh.EnduranceStops == 1 && quickStop.Blocking && quickStop.State == BridgeState.Cancelled,
+    "Quick synthesis stops repeat mode immediately while the current batch is still active");
+qsh.QuickActive = false; EndCraft(quickStop, qsh); qsh.Now += 2100; quickStop.Tick();
+Check(!quickStop.Blocking && qsh.Enables == 1, "Quick batch exit completes user stop without restarting AR");
+
+var (ownPending, oph) = Begin(); Arrive(ownPending, oph); Boundary(ownPending, oph);
+oph.UsesLocalCraftQueue = true; Submit(ownPending, oph); oph.RecipeMatchesResult = false;
+ownPending.Cancel(); ownPending.Tick(); oph.Now += 2100; ownPending.Tick(); oph.Now += 2100; ownPending.Tick();
+Check(oph.LocalCancelCalls > 0 && !ownPending.Blocking && !oph.PendingCraftQueued && oph.Enables == 1,
+    "Own native queue can cancel before recipe selection without requiring foreign menu ownership");
+var (fastNative, fnh) = Begin(); Arrive(fastNative, fnh); Boundary(fastNative, fnh);
+fnh.UsesLocalCraftQueue = true; Submit(fastNative, fnh);
+fnh.PendingCraftQueued = false; fnh.LocalHasStarted = true; fnh.ArtisanEndurance = false;
+fastNative.Tick();
+Check(fastNative.State == BridgeState.Crafting && !fnh.ActualCraftActive,
+    "Historical start proof captures a fast native craft that has already ended between bridge polls");
+fastNative.Tick(); EndCraft(fastNative, fnh);
+Check(fastNative.State == BridgeState.WaitingForFirst && fnh.Crafts == 1,
+    "Native completed count enters monitoring without another crafting request");
+var (nativeFailure, nfh) = Begin(); Arrive(nativeFailure, nfh); Boundary(nativeFailure, nfh);
+nfh.UsesLocalCraftQueue = true; Submit(nativeFailure, nfh); nfh.CraftError = "verified failure";
+nativeFailure.Tick();
+Check(nativeFailure.State == BridgeState.Failed && nfh.LocalCancelCalls > 0 && nfh.Crafts == 1,
+    "Native failure revokes queued starts and is never mistaken for successful count completion");
+
+var (nativeRejected, nrh) = Begin(); Arrive(nativeRejected, nrh); Boundary(nativeRejected, nrh);
+nrh.UsesLocalCraftQueue = true; nrh.ThrowCraftBeforeAccept = true; Submit(nativeRejected, nrh);
+nativeRejected.Tick(); nrh.Now += 2100; nativeRejected.Tick(); nrh.Now += 2100; nativeRejected.Tick();
+Check(nativeRejected.State == BridgeState.Failed && !nativeRejected.Blocking && !nrh.LocalAccepted && !nrh.PendingCraftQueued && nrh.Enables == 1,
+    "Rejected local Begin has no private pending work and can clean up without ever being accepted");
+
 Console.WriteLine($"{assertions} assertions passed.");
+
+sealed class FakeMaterials : IMaterialPreparation
+{
+    public MaterialPreparationState State { get; set; }
+    public bool Blocking { get; set; }
+    public string Detail => "fake preparation";
+    public int Begins, Cancels, Ticks;
+    public bool Disposed, ThrowCancel;
+    public (ushort Recipe, int Count, ulong Cid) Request;
+    public void Begin(ushort recipe, int count, ulong cid)
+    { Begins++; Request = (recipe, count, cid); State = MaterialPreparationState.Running; Blocking = true; }
+    public void Tick() { Ticks++; }
+    public void Cancel() { Cancels++; if(ThrowCancel) throw new InvalidOperationException("cancel failed"); if(State != MaterialPreparationState.Failed) State = MaterialPreparationState.Cancelling; }
+    public void Dispose() { Disposed = true; }
+}
 
 sealed class FakeHost : IBridgeHost
 {
@@ -190,7 +313,15 @@ sealed class FakeHost : IBridgeHost
     public bool SafeCraftBoundary { get; set; } = true;
     public bool ArtisanEndurance { get; set; }
     public bool ArtisanForeignControl { get; set; }
-    public bool ArtisanIdle => !ArtisanEndurance && !ActualCraftActive && !ArtisanForeignControl;
+    public bool ArtisanIdle => !PendingCraftQueued && !ArtisanEndurance && !ActualCraftActive && !ArtisanForeignControl;
+    public bool CraftRequestAccepted => UsesLocalCraftQueue ? LocalAccepted : ArtisanEndurance;
+    public bool CanStopCraftNow => UsesLocalCraftQueue || SafeCraftBoundary || !ActualCraftActive || QuickActive;
+    public bool CraftHasStarted => UsesLocalCraftQueue ? LocalHasStarted : ActualCraftActive;
+    public string? CraftError { get; set; }
+    public bool UsesLocalCraftQueue { get; set; }
+    public bool LocalAccepted, LocalHasStarted, ThrowCraftBeforeAccept;
+    public int LocalCancelCalls;
+    public bool PendingCraftQueued, QuickActive;
     public bool HeadReady, QueuedSwitch, ThrowRelog;
     public bool RecipeMatchesResult = true;
     public int Enables, Crafts, EnduranceStops, CloseCalls, RequestRetainers, RequestCharacters, FinishRetainers, FinishCharacters, EscapedSwitches, NavigationAborts;
@@ -214,7 +345,8 @@ sealed class FakeHost : IBridgeHost
     public void FinishRetainer() { FinishRetainers++; Calls.Add("finish-retainer"); }
     public void RequestCharacter(string owner) { RequestCharacters++; Calls.Add("request-character"); }
     public void FinishCharacter() { FinishCharacters++; if(QueuedSwitch) EscapedSwitches++; Calls.Add("finish-character"); }
-    public void Craft(ushort recipe, int count) { Crafts++; CraftedCid = CurrentCid; ArtisanEndurance = true; Calls.Add("craft"); }
+    public void Craft(ushort recipe, int count) { Crafts++; if(ThrowCraftBeforeAccept) throw new InvalidOperationException("rejected before native action"); CraftedCid = CurrentCid; PendingCraftQueued = true; LocalAccepted = UsesLocalCraftQueue; Calls.Add("craft"); }
+    public void CancelPendingCraft() { if(UsesLocalCraftQueue) { LocalCancelCalls++; PendingCraftQueued = false; ArtisanEndurance = false; } }
     public void StopEndurance() { EnduranceStops++; ArtisanEndurance = false; Calls.Add("stop-endurance"); }
     public bool CloseOwnRecipe(ushort recipe) { CloseCalls++; UiReleased = true; Calls.Add("close-recipe"); return true; }
 }

@@ -45,7 +45,17 @@ internal static class ReadinessRules
 internal enum BridgeState
 {
     Idle, StartingCycle, TravellingToFirst, Retainers, DrainingRetainers,
-    CraftPending, Crafting, StoppingCraft, WaitingForFirst, Failed, Cancelled,
+    PreparingMaterials, StoppingMaterials, CraftPending, Crafting, StoppingCraft, WaitingForFirst, Failed, Cancelled,
+}
+internal enum MaterialPreparationState { Idle, Running, Completed, Cancelling, Cancelled, Failed }
+internal interface IMaterialPreparation : IDisposable
+{
+    MaterialPreparationState State { get; }
+    bool Blocking { get; }
+    string Detail { get; }
+    void Begin(ushort recipe, int count, ulong cid);
+    void Tick();
+    void Cancel();
 }
 internal interface IBridgeHost
 {
@@ -61,6 +71,11 @@ internal interface IBridgeHost
     bool ArtisanIdle { get; }
     bool ArtisanEndurance { get; }
     bool ArtisanForeignControl { get; }
+    bool CraftRequestAccepted { get; }
+    bool CanStopCraftNow { get; }
+    bool CraftHasStarted { get; }
+    string? CraftError { get; }
+    bool UsesLocalCraftQueue { get; }
     bool FirstReady(CyclePlan plan);
     IReadOnlyList<TargetRetainer> ReadVisitTargets(ulong cid);
     CharacterSnapshot? ReadCharacter(ulong cid);
@@ -75,6 +90,7 @@ internal interface IBridgeHost
     void RequestCharacter(string owner);
     void FinishCharacter();
     void Craft(ushort recipe, int count);
+    void CancelPendingCraft();
     void StopEndurance();
     bool CloseOwnRecipe(ushort recipe);
 }
