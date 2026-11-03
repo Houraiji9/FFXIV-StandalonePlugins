@@ -2,9 +2,9 @@
 
 两个分别安装、分别配置的国服 Dalamud 插件。源码和安装包放在同一个仓库，安装时可只选其中一个。无需替换 DailyRoutines、AutoRetainer 或 Artisan 的 DLL。
 
-**当前 BatchTrade 为 0.1.1、RetainerCraftBridge 为 0.1.0，均为预发布候选：目标环境为国服 Soil / Dalamud API 15、.NET 10。离线编译和逻辑测试不代表真实客户端验收。** 游戏更新、插件更新后的接口兼容性需要重新核对。
+**当前 BatchTrade 为 0.1.2、RetainerCraftBridge 为 0.1.0，均为预发布候选：目标环境为国服 Soil / Dalamud API 15、.NET 10。离线编译和逻辑测试不代表真实客户端验收。** 游戏更新、插件更新后的接口兼容性需要重新核对。
 
-BatchTrade 0.1.1 的交易回调适配限定国服游戏版本 `2026.10.06.0000.0000`；版本不符时拒绝执行原生交易操作，需先更新适配。
+BatchTrade 0.1.2 的交易回调适配限定国服游戏版本 `2026.10.06.0000.0000`；版本不符时拒绝执行原生交易操作，需先更新适配。
 
 | 插件 | 命令 | 功能 | 运行依赖 |
 | --- | --- | --- | --- |
@@ -45,10 +45,10 @@ Windows、PowerShell 7、.NET SDK 10.0.100（或同功能带的补丁版本）�
 ```powershell
 ./scripts/Get-DalamudSdk.ps1
 ./scripts/Build.ps1
-./scripts/Package.ps1 -Tag v0.1.1 -Plugins @('BatchTrade')
+./scripts/Package.ps1 -Tag v0.1.2 -Plugins @('BatchTrade')
 ```
 
-本次输出在 `artifacts/v0.1.1/`。只打包所选择的插件，合并索引时保留其他插件已发布的版本和下载地址。非空输出目录不会被覆盖，可用 `-OutputDirectory` 指定新的目录。插件 ZIP 仅包含本插件 DLL、清单、说明及许可证，不含游戏或其他插件二进制。也可在构建时传 `-DalamudLibPath` 使用相同 API 的本地引用。
+本次输出在 `artifacts/v0.1.2/`。只打包所选择的插件，合并索引时保留其他插件已发布的版本和下载地址。非空输出目录不会被覆盖，可用 `-OutputDirectory` 指定新的目录。插件 ZIP 仅包含本插件 DLL、清单、说明及许可证，不含游戏或其他插件二进制。也可在构建时传 `-DalamudLibPath` 使用相同 API 的本地引用。
 
 GitHub Actions 在推送时执行构建和测试，根据 manifest 与已发布索引的版本差异选择要打包的插件。发布流程是：先验证构建产物，上传版本 Release 及 ZIP，然后将已验证 URL 对应的 `pluginmaster.json` 更新到主分支。源码推送与 Release 分发是独立步骤。
 

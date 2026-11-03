@@ -6,5 +6,6 @@
   <ItemGroup>
     <Compile Include="../../plugins/BatchTrade/TradeRules.cs" Link="TradeRules.cs" />
     <Compile Include="../../plugins/BatchTrade/GameCompatibility.cs" Link="GameCompatibility.cs" />
+    <Compile Include="../../plugins/BatchTrade/TradeOfferRules.cs" Link="TradeOfferRules.cs" />
   </ItemGroup>
 </Project>

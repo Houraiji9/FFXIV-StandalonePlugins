@@ -127,11 +127,11 @@ public static class TradeRules
             }
             else if (i == filling)
             {
-                if (slot.Item.Id == 0 && slot.Quantity == 0) continue;
+                if (slot.Quantity == 0) continue;
                 // MoveItemSlot creates a symbolic Trade slot with Quantity=1 before opening InputNumeric.
                 if (slot.Item != selected || (slot.Quantity != 1 && !(quantitySubmitted && slot.Quantity == plan[i].Quantity))) return false;
             }
-            else if (slot.Item.Id != 0 || slot.Quantity != 0) return false;
+            else if (slot.Quantity != 0) return false;
         }
         return true;
     }
@@ -188,11 +188,11 @@ public static class TradeRules
 
     public static bool ValidOffer(IEnumerable<BagSlot> offered, ItemKey selected, int quantity, int gil)
     {
-        var list = offered.Where(s => s.Item.Id != 0 || s.Quantity != 0).ToArray();
+        var list = offered.Where(s => s.Quantity != 0).ToArray();
         return gil == 0 && list.Length <= 5 && list.All(s => s.Item == selected && s.Quantity > 0)
             && list.Sum(s => (long)s.Quantity) == quantity;
     }
 
     public static bool EmptyRemote(IEnumerable<BagSlot> offered, int gil) =>
-        gil == 0 && offered.All(s => s.Item.Id == 0 && s.Quantity == 0);
+        gil == 0 && offered.All(s => s.Quantity == 0);
 }

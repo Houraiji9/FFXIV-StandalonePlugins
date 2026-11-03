@@ -177,4 +177,98 @@ Check(!TradeRules.PendingSlotMatches(temporaryOne, partialPlan, 0, item, 1, fals
 Check(NumericPopupRules.Check(popup with { Amount = 99, SourceQuantity = 99, ItemStackLimit = 99, Maximum = 999, RemainingBatchCap = 99 }) == NumericCheck.Ready,
     "popup upper range may exceed source but the planned submission never does");
 Check(GameCompatibility.IsSupported("2026.10.06.0000.0000\r\n", 0x3730), "version file trailing newline normalized before exact check");
+// v0.1.2 reproduces the native dual view: raw HandIn slots are symbolic, local cache is resolved.
+TradeOfferSnapshot View(IReadOnlyList<PlannedSlot> expected, params int[] quantities)
+{
+    var raw = new WorkingTradeSlot[5];
+    var cache = Offer().ToArray();
+    for (var i = 0; i < quantities.Length; i++)
+    {
+        var source = expected[i].Source;
+        raw[i] = new(source.Item, quantities[i], true, source.Container, source.Slot);
+        // The cache's physical container/slot can be copied from the source; no raw-link contract exists here.
+        cache[i] = source with { Quantity = quantities[i] };
+    }
+    return new(true, raw, expected.Select(x => x.Source).ToArray(), cache, Offer().ToArray(), 0, 0, false);
+}
+var dual = View(partialPlan, 1);
+Check(TradeOfferRules.Check(dual, partialPlan, 0, true).Code == OfferCheckCode.QuantityReady,
+    "raw symbolic source plus normalized nonsymbolic cache authorizes own quantity submission");
+var rawEmpty = View(partialPlan);
+Check(TradeOfferRules.Check(rawEmpty, partialPlan, 0, true).Code == OfferCheckCode.WaitingWorking,
+    "empty working slot never authorizes quantity even when popup ownership would be valid");
+Check(TradeOfferRules.Check(dual with { WorkingAvailable = false }, partialPlan, 0, true).Code == OfferCheckCode.WaitingWorking,
+    "unavailable or nonowned working container never authorizes quantity");
+var completedDual = View(partialPlan, 262);
+Check(TradeOfferRules.Check(completedDual, partialPlan, 0, true, true).Code == OfferCheckCode.Ready,
+    "own numeric submission and exact working plus resolved cache complete a partial stack");
+Check(TradeOfferRules.Check(completedDual, partialPlan, 0, true).Code == OfferCheckCode.WorkingQuantity,
+    "externally changed raw quantity is rejected before own numeric submission");
+Check(TradeOfferRules.Check(dual, onePlan, 0, true).Code == OfferCheckCode.QuantityReady,
+    "cap1 with a larger source still requires own numeric despite both views already showing1");
+Check(TradeOfferRules.Check(dual, onePlan, 0, true, true).Code == OfferCheckCode.Ready,
+    "cap1 becomes ready only after its own submission");
+Check(TradeOfferRules.Check(View(singlePlan, 1), singlePlan, 0, true).Code == OfferCheckCode.Ready,
+    "single-item source skips numeric only with valid raw source and synchronized cache");
+var lag = completedDual with { LocalCache = Offer().ToArray() };
+Check(TradeOfferRules.Check(lag, partialPlan, 1).Code == OfferCheckCode.WaitingCache,
+    "complete working262 plus empty cache cannot propose");
+lag = completedDual with { LocalCache = Offer(new BagSlot(0, 0, other, 999)).ToArray() };
+Check(TradeOfferRules.Check(lag, partialPlan, 1).Code == OfferCheckCode.WaitingCache,
+    "old cache item and quantity wait rather than claim raw tampering");
+Check(TradeOfferRules.Check(dual with { LocalCache = lag.LocalCache }, partialPlan, 0, true).Code == OfferCheckCode.QuantityReady,
+    "only raw working evidence authorizes numeric while resolved cache lags");
+Check(TradeOfferRules.Check(completedDual with { SyncPending = true }, partialPlan, 1).Code == OfferCheckCode.WaitingSync,
+    "matching views with pending network synchronization cannot propose or confirm");
+Check(TradeOfferRules.Check(completedDual, partialPlan, 1).Code == OfferCheckCode.Ready &&
+      TradeOfferRules.Check(lag, partialPlan, 1).Code == OfferCheckCode.WaitingCache,
+    "previously ready view never authorizes action after cache regression");
+var mutatedView = View(twoPlan, 99, 1);
+mutatedView.RawWorking[0] = mutatedView.RawWorking[0] with { Quantity = 98 };
+Check(TradeOfferRules.Check(mutatedView with { SyncPending = true }, twoPlan, 1, true).Code == OfferCheckCode.WorkingQuantity,
+    "completed raw prefix mutation remains terminal during network delay");
+mutatedView = View(partialPlan, 1);
+mutatedView.RawWorking[0] = mutatedView.RawWorking[0] with { Symbolic = false };
+Check(TradeOfferRules.Check(mutatedView, partialPlan, 0, true).Code == OfferCheckCode.WorkingNotSymbolic,
+    "resolved cache accidentally passed as raw working cannot authorize submission");
+mutatedView = View(partialPlan, 1);
+mutatedView.RawWorking[0] = mutatedView.RawWorking[0] with { LinkedContainer = 2 };
+Check(TradeOfferRules.Check(mutatedView, partialPlan, 0, true) == new OfferCheck(OfferCheckCode.SourceContainer, 0),
+    "wrong raw source container reports exact code and physical slot");
+mutatedView = View(partialPlan, 1);
+mutatedView.RawWorking[0] = mutatedView.RawWorking[0] with { LinkedSlot = 20 };
+Check(TradeOfferRules.Check(mutatedView, partialPlan, 0, true).Code == OfferCheckCode.SourceSlot,
+    "wrong raw source slot is distinct from quantity mismatch");
+mutatedView = View(partialPlan, 1);
+mutatedView.Sources[0] = mutatedView.Sources[0] with { Quantity = 998 };
+Check(TradeOfferRules.Check(mutatedView, partialPlan, 0, true).Code == OfferCheckCode.SourceQuantity,
+    "mutatedView original source quantity cannot authorize numeric");
+mutatedView = View(partialPlan, 1);
+mutatedView.RawWorking[0] = mutatedView.RawWorking[0] with { Item = hq };
+Check(TradeOfferRules.Check(mutatedView, partialPlan, 0, true).Code == OfferCheckCode.WorkingItem,
+    "raw source quality mismatch has its own failure");
+mutatedView = View(partialPlan, 262);
+mutatedView.RawWorking[0] = mutatedView.RawWorking[0] with { Quantity = 0 };
+Check(TradeOfferRules.Check(mutatedView, partialPlan, 1).Code == OfferCheckCode.WorkingQuantity,
+    "completed prefix becoming zero is never ignored as an empty cache slot");
+mutatedView = View(partialPlan, 262);
+mutatedView.RawWorking[1] = new(item, 0, true, 0, 8);
+Check(TradeOfferRules.Check(mutatedView, partialPlan, 1).Code == OfferCheckCode.WaitingWorking,
+    "zero-quantity raw ghost link blocks next steps until native clear");
+mutatedView = View(partialPlan, 262);
+mutatedView.LocalCache[4] = new(2, 20, other, 0);
+mutatedView.RemoteCache[3] = new(2, 21, other, 0);
+Check(TradeOfferRules.Check(mutatedView, partialPlan, 1).Code == OfferCheckCode.Ready,
+    "stale IDs in zero-quantity resolved cache are semantically empty");
+Check(TradeRules.ValidOffer([new(0, 0, item, 262), new(1, 5, other, 0)], item, 262, 0) &&
+      TradeRules.EmptyRemote([new(1, 7, other, 0)], 0), "generic offer validators use quantity-zero empty semantics");
+Check(!TradeRules.EmptyRemote([new(0, 0, default, -1)], 0) &&
+      !TradeRules.ValidOffer([new(0, 0, item, -1)], item, -1, 0), "negative quantity never counts as empty");
+Check(TradeOfferRules.Check(completedDual with { LocalGil = 1 }, partialPlan, 1).Code == OfferCheckCode.LocalGil &&
+      TradeOfferRules.Check(completedDual with { RemoteGil = 1 }, partialPlan, 1).Code == OfferCheckCode.RemoteOffer,
+    "cache lag exception never relaxes either gil safety gate");
+var diagnostic = System.Text.Json.JsonSerializer.Serialize(new { Plan = partialPlan, Observation = completedDual });
+Check(diagnostic.Contains("RawWorking") && diagnostic.Contains("LocalCache") && diagnostic.Contains("Sources") &&
+      !diagnostic.Contains("Entity") && !diagnostic.Contains("Pointer") && !diagnostic.Contains("Name"),
+    "offer diagnostic exposes both views and source evidence without identity or pointer fields");
 Console.WriteLine($"PASS {checks} checks");

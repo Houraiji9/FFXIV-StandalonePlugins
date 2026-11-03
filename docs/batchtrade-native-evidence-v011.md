@@ -2,6 +2,8 @@
 
 本记录用于实现审查。检查日期：2026-11-03。只读取客户端 PE 文件、公开源代码和离线表数据；没有执行交易、调用游戏 IPC、修改客户端或验证网络行为。本文不包含客户端二进制、账号、角色信息或个人安装路径。
 
+**0.1.2 勘误：原记录对交易缓存仍保留 symbolic 链接的判断有误。** `InventoryContainer.GetInventorySlot` 会解析链接并返回源背包格；缓存随后复制源物品，再从实际交易格取得交易数量。0.1.1 将缓存必须为 symbolic 作为前提，会拒绝正常物品。完整调用链与正确读取方法见[0.1.2 更正证据](batchtrade-native-evidence-v012.md)。下列相关条目已修正，其他接收者与生命周期证据不因此改变。
+
 ## 适用版本
 
 - 客户端 `ffxivgame.ver`：`2026.10.06.0000.0000`。
@@ -43,8 +45,8 @@
 - `MoveItemSlot` 的普通背包到 Trade 分支，先调用 helper `RVA 0x8710E0`。该 helper 在 `0x8712BD` 调用 `InventoryItem.SetLinkedItem`，将 Trade 槽链接到原背包容器/格；接着在 `0x8712C5`/`0x8712CD` 设置 **Trade 槽本身 Quantity = 1**。该步骤没有从原背包扣除库存。
 - 返回后，`0x86E08A` 至 `0x86E096` 检查原物品 `GetQuantity()`。大于 `1` 才继续打开 InputNumeric；小于等于 `1` 跳过数量窗口。因此 `sourceQuantity > 1` 时，即使计划量也是 `1`、当前本方交易数已恰好等于计划，也必须等待并完成本次数量窗口。
 - [InventoryItem.cs](https://github.com/Dalamud-DailyRoutines/FFXIVClientStructs/blob/87d51a788ee33329f20b06243be332dd4d35b13c/FFXIVClientStructs/FFXIV/Client/Game/InventoryItem.cs) 公开 `IsSymbolic`（`+0x0E`）、`LinkedItemSlot`（`+0x10`）、`LinkedInventoryType`（`+0x12`）。`ItemId` 与两个链接字段重叠，因此 symbolic Trade 槽不能直接把 `.ItemId` 当物品 ID。
-- `RVA 0x87CDD0` 的本地交易槽读取过程将容器 `2005` 的槽复制到 `InventoryManager.TradeItemsLocal` 缓存；`0x87CE40` 至 `0x87CE50` 保留 IsSymbolic、链接联合字段和本槽数量。因此直接读取该缓存 `.ItemId` 同样会遇到链接字段，不能认为缓存必然已经把 symbolic 解析成实物。
-- 对真实原生槽指针调用公开 `GetBaseItemId()`、`GetFlags()`、`GetQuantity()` 可正确读取身份、品质和数量。不要在复制出的托管局部结构上调用这些原生方法。新填槽还应检查 symbolic 链接恰好指向冻结的源容器和格。
+- **已更正：** `RVA 0x87CDD0` 通过容器 `2005` 的 `GetInventorySlot` 取得已解析的源背包格，然后逐字段复制到 `InventoryManager.TradeItemsLocal`，末尾单独从原交易格读取交易数量。逐字段复制不意味着源指针仍指向原始 symbolic 格；旧记录漏查了这个 getter 的实现。
+- 对真实原生槽指针调用公开 `GetBaseItemId()`、`GetFlags()`、`GetQuantity()` 可正确读取身份、品质和数量。不要在复制出的托管局部结构上调用这些原生方法。**原始来源链接必须从 `container->Items + i` 检查**，不能用会解引用的 `GetInventorySlot(i)`，也不能要求普通缓存仍保留链接。
 - 空缓存槽也已构造：`InventoryManager` 构造函数 `RVA 0x8963B0` 在 `0x896421`/`0x896426` 开始六个本地槽的初始化循环，`0x896443` 为每槽写入 `InventoryItem` vtable `RVA 0x21942E8` 并清空 IsSymbolic、ItemId、Quantity；`0x89648C`/`0x8964A2` 对六个远端槽做相同初始化。因此本版本对两侧前五格（含空格）的真实缓存槽调用 getter，不会仅因为格为空而解引用未初始化 vtable。
 - 本机 `GetQuantity` vfunc 12 为 `RVA 0x868940`：非 symbolic 返回本槽 `+0x14`；symbolic 返回 `min(本槽 Quantity, 链接源的 GetQuantity())`。`SetQuantity` vfunc 13 为 `RVA 0x8689B0`，仅写本槽 `+0x14`。因此有效 Trade 数量不是源堆数量的无条件副本。
 - 数量 handler `RVA 0x887110` 在 `0x88714A` 取得先前记录的 Trade 目标槽，在 `0x88716B` 对该槽执行 SetQuantity(输入值)，之后才产生数量同步操作。

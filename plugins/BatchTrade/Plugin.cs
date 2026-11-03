@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Text.Json;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Configuration;
 using Dalamud.Game.Addon.Lifecycle;
@@ -61,9 +62,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private readonly record struct Identity(uint Entity, string Name, ushort World);
     private readonly record struct StartRequest(uint ItemId, bool HighQuality, int TotalQuantity, int TimeoutSeconds, int BatchQuantityCap, TradeDelays Delays, Identity? Target);
     private sealed record UiSnapshot(bool Running, bool Cancelling, bool FinalSubmitted, int Goal, int Delivered,
-        string RecipientLabel, Identity? Target, uint[] ItemIds, IReadOnlyDictionary<ItemKey, long> Totals, string Status, string DelayLabel, int DelayRemainingMs);
+        string RecipientLabel, Identity? Target, uint[] ItemIds, IReadOnlyDictionary<ItemKey, long> Totals, string Status, string DelayLabel, int DelayRemainingMs, string LastDiagnostic);
     private UiSnapshot uiSnapshot = new(false, false, false, 0, 0, "", null, [], new Dictionary<ItemKey, long>(),
-        "请选择物品、品质和总数量，然后选中接收玩家。", "", 0);
+        "请选择物品、品质和总数量，然后选中接收玩家。", "", 0, "");
     private Config config = null!;
     private Stage stage;
     private ItemKey selected;
@@ -90,6 +91,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private uint initialGil;
     private List<PlannedSlot> batch = [];
     private Dictionary<ItemKey, long> baseline = [];
+    private string lastDiagnostic = "";
+    private bool diagnosticRecorded;
+    private TradeOfferSnapshot? lastOfferView;
+    private OfferCheck lastOfferCheck;
     private string status = "请选择物品、品质和总数量，然后选中接收玩家。";
     private bool Running => stage != Stage.Idle;
     private static long Now => Environment.TickCount64;
@@ -303,6 +308,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (snapshot.Cancelling) ImGui.TextUnformatted("已撤销后续操作，等待安全间隔后取消当前交易。");
         else if (pending) ImGui.TextUnformatted("正在等待游戏线程处理操作……");
         ImGui.TextWrapped(Volatile.Read(ref dispatchError) ?? snapshot.Status);
+        if (!string.IsNullOrEmpty(snapshot.LastDiagnostic))
+        {
+            if (ImGui.Button("复制最后诊断")) ImGui.SetClipboardText(snapshot.LastDiagnostic);
+            if (ImGui.CollapsingHeader("最后诊断（不含玩家身份）")) ImGui.TextWrapped(snapshot.LastDiagnostic);
+        }
     }
 
     private void EditBoundedInt(string label, ref int value, int minimum, int maximum)
@@ -334,7 +344,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             Running ? $"锁定接收方：{recipient.Name}（世界 #{recipient.World}）" : "", target, ids, totals, status,
             pendingCancel != null ? "取消交易倒计时" : stage == Stage.Starting ? "启动倒计时" :
                 stage == Stage.BetweenBatches ? "下一笔交易倒计时" : StepName(clock.PendingAction),
-            (Running && stage != Stage.Settlement || pendingCancel != null) ? clock.DelayRemaining(Now) : 0);
+            (Running && stage != Stage.Settlement || pendingCancel != null) ? clock.DelayRemaining(Now) : 0, lastDiagnostic);
 
     private void PublishStateOnly()
     {
@@ -361,6 +371,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         baseline = TradeRules.Totals(ReadInventory());
         if (baseline.GetValueOrDefault(selected) < request.TotalQuantity)
         { status = "该品质物品数量不足，请调整总数量或品质。"; return; }
+        diagnosticRecorded = false; lastOfferView = null; lastDiagnostic = "";
         sender = Describe(local); recipient = target; goal = request.TotalQuantity; delivered = 0;
         activeTimeoutSeconds = Math.Clamp(request.TimeoutSeconds, 15, 600);
         activeBatchCap = Math.Clamp(request.BatchQuantityCap, 1, 999);
@@ -455,8 +466,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
             { Stop("等待接受交易时背包发生了变化，已停止。", true); return; }
             if (!Visible(Trade)) return;
             if (manager->TradePartnerEntityId != recipient.Entity) { Stop("交易对象与锁定玩家不符，已停止。", false); return; }
-            if (!OffersMatch(0)) { Stop("交易窗口已有未授权内容，已停止。", true); return; }
-            ownedTradePointer = (nint)Trade; ownedTradeGeneration = tradeGeneration;
+            if (ownedTradePointer == 0) { ownedTradePointer = (nint)Trade; ownedTradeGeneration = tradeGeneration; }
+            if ((nint)Trade != ownedTradePointer || ownedTradeGeneration != tradeGeneration)
+            { Stop("原交易窗口已被替换，已停止；不会操作新窗口。", false); return; }
+            if (!RequireOffers(0, "交易窗口已有未授权内容")) return;
             stage = Stage.OpeningMenu;
         }
         if (ownedTradePointer != 0 && ((nint)Trade != ownedTradePointer || tradeGeneration != ownedTradeGeneration))
@@ -472,7 +485,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             case Stage.SelectingMenu: SelectTradeOption(); break;
             case Stage.WaitingItem: WaitForItem(); break;
             case Stage.Ready:
-                if (!OffersMatch(batchQuantity)) { Stop("本方交易物品或数量被修改，已停止。", true); return; }
+                if (!RequireOffers(batch.Count, "本方交易物品或数量被修改")) return;
                 if (manager->TradeIsSyncPending) return;
                 if (Visible(SelectYesno) || Visible(InputNumeric) || Visible(ContextAddon))
                 { Stop("出现了无关弹窗，已停止。", true); return; }
@@ -487,7 +500,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                     Stop("未找到交易按钮唯一有效的本地点击事件，已停止。", true);
                 break;
             case Stage.AwaitFinal:
-                if (!OffersMatch(batchQuantity)) { Stop("确认期间交易内容被修改，已停止。", true); return; }
+                if (!RequireOffers(batch.Count, "确认期间交易内容被修改")) return;
                 if (manager->TradeLocalState == TradeState.SelectingTradeGoods)
                 { Stop("交易确认已被撤销，已停止。", true); return; }
                 if (finalSubmitted || !Visible(SelectYesno)) return;
@@ -505,7 +518,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void OpenItemMenu()
     {
-        if (!OffersMatch(filled)) { Stop("填充前交易内容不匹配，已停止。", true); return; }
+        if (!RequireOffers(filling, "填充前交易内容不匹配")) return;
         if (Visible(ContextAddon) || Visible(InputNumeric) || Visible(SelectYesno))
         { Stop("已有其他菜单或弹窗，已停止。", true); return; }
         var planned = batch[filling];
@@ -526,7 +539,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void SelectTradeOption()
     {
-        if (!OffersMatch(filled)) { Stop("菜单期间交易内容变化，已停止。", true); return; }
+        if (!RequireOffers(filling, "菜单期间交易内容变化")) return;
         if (!Visible(ContextAddon)) return;
         var agent = AgentInventoryContext.Instance();
         var planned = batch[filling];
@@ -568,23 +581,22 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         if (Visible(SelectYesno))
         { Stop("放入物品时出现了额外确认窗口，已停止；本插件不代确认此提示。", true); return; }
-        var manager = InventoryManager.Instance();
-        var offered = ReadOffer(true);
         var planned = batch[filling];
-        if (!OfferSourceLinksMatch() || !TradeRules.PendingSlotMatches(offered, batch, filling, selected, manager->TradeItemsLocal[5].Quantity, numericSubmitted))
-        { Stop("待填交易格或此前已填物品格被修改，已停止。", true); return; }
+        var check = InspectOffers(filling, true);
+        if (check.Failed) { StopOffer("待填交易格或此前已填物品格被修改", check); return; }
         // The temporary quantity is 1 even when the planned amount is also 1. A source stack >1
         // must complete this operation's own numeric callback before that quantity can count as filled.
         if (planned.Source.Quantity > 1 && !numericSubmitted)
         {
-            if (!Visible(InputNumeric)) return;
+            // A visible popup alone is insufficient: the raw slot must already bind the expected source.
+            if (check.Code != OfferCheckCode.QuantityReady || !Visible(InputNumeric)) return;
             if ((nint)InputNumeric != numericPointer)
             { Stop("数量窗口被替换：不是本次菜单操作记录的实例，已停止。", true); return; }
             SubmitQuantity(planned.Quantity);
             return;
         }
         if (Visible(InputNumeric)) return;
-        if (!TradeRules.IsSlotComplete(offered, batch, filling, selected, manager->TradeItemsLocal[5].Quantity, numericSubmitted)) return;
+        if (check.Code != OfferCheckCode.Ready) return;
         var closeMenu = Visible(ContextAddon);
         if (closeMenu && ((nint)ContextAddon != contextPointer || menuGeneration != expectedMenuGeneration))
         { Stop("物品菜单被替换，已停止。", true); return; }
@@ -659,11 +671,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (decrease < settlementDecrease) { Stop("结算期间库存变化被反向修改，已停止。", false); return; }
         settlementDecrease = decrease;
         var manager = InventoryManager.Instance();
-        if (Visible(Trade) && manager->TradePartnerEntityId != recipient.Entity)
-        { Stop("结算期间出现了其他交易，已停止；不会关闭该窗口。", false); return; }
-        if (Visible(Trade) && !OffersMatch(batchQuantity) && change == InventoryChange.Unchanged)
-        { Stop("结算前交易内容发生变化，已停止。", true); return; }
         var ended = ownedTradeClosed || !Visible(Trade) || manager->TradeLocalState <= TradeState.NotTrading;
+        if (!ended && (manager->TradePartnerEntityId != recipient.Entity || (nint)Trade != ownedTradePointer || tradeGeneration != ownedTradeGeneration))
+        { Stop("结算期间出现了其他交易，已停止；不会关闭该窗口。", false); return; }
+        // Native end can clear working slots before inventory notification. After end, only reconcile signals.
+        if (!ended && change == InventoryChange.Unchanged)
+        {
+            var check = InspectOffers(batch.Count);
+            if (check.Failed) { StopOffer("结算前交易内容发生变化", check, false); return; }
+        }
         if (change != InventoryChange.Unchanged || ended) StartSettlementWindow();
         var result = CompletionGate.Evaluate(completionMessage, change, ended);
         if (result == CompletionResult.Invalid)
@@ -815,6 +831,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private void Stop(string reason, bool cancelOwnTrade)
     {
         var previousStage = stage;
+        if (Running && !diagnosticRecorded) RecordDiagnostic(reason);
         var wasRunning = Running; stage = Stage.Idle;
         if (!wasRunning && pendingCancel != null) return; // Repeated Stop never restarts the cancellation timer.
         clock.CancelPending();
@@ -903,30 +920,94 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var manager = InventoryManager.Instance();
         return manager != null && TradeRules.EmptyRemote(ReadOffer(false), manager->TradeItemsRemote[5].Quantity);
     }
-    private bool OffersMatch(int expected)
+    private OfferCheck InspectOffers(int completed, bool pending = false)
     {
-        var manager = InventoryManager.Instance();
-        return manager != null && RemoteEmpty() && OfferSourceLinksMatch() && TradeRules.ValidOffer(ReadOffer(true), selected, expected, manager->TradeItemsLocal[5].Quantity);
+        lastOfferView = CaptureOffers();
+        lastOfferCheck = TradeOfferRules.Check(lastOfferView, batch, completed, pending, numericSubmitted);
+        return lastOfferCheck;
     }
-    private bool OfferSourceLinksMatch()
+
+    private bool RequireOffers(int completed, string reason)
+    {
+        var check = InspectOffers(completed);
+        if (check.Failed) { StopOffer(reason, check); return false; }
+        return check.Code == OfferCheckCode.Ready;
+    }
+
+    private void StopOffer(string reason, OfferCheck check, bool cancel = true)
+    {
+        RecordDiagnostic(check.Code.ToString(), check.Slot, lastOfferView);
+        Stop($"{reason} [{check.Code}{(check.Slot >= 0 ? $" / 格 {check.Slot + 1}" : "")}]，已停止。", cancel);
+    }
+
+    private TradeOfferSnapshot CaptureOffers()
     {
         var manager = InventoryManager.Instance();
-        if (manager == null) return false;
-        fixed (InventoryItem* first = manager->TradeItemsLocal)
+        var sources = batch.Select(x => ReadSource(x.Source.Container, x.Source.Slot)).ToArray();
+        var working = new WorkingTradeSlot[5];
+        var available = manager != null && ownedTradePointer != 0 && (nint)Trade == ownedTradePointer &&
+            ownedTradeGeneration == tradeGeneration && Visible(Trade) && manager->TradePartnerEntityId == recipient.Entity &&
+            manager->TradeLocalState > TradeState.NotTrading;
+        var container = available ? manager->GetInventoryContainer(InventoryType.HandIn) : null;
+        available = container != null && container->Items != null && container->Size >= 5;
+        if (available)
         {
             for (var i = 0; i < 5; i++)
             {
-                var offered = first + i;
-                if (offered->Quantity == 0) continue;
-                if (i >= batch.Count || !offered->IsSymbolic) return false;
-                var source = batch[i].Source;
-                if ((InventoryType)offered->LinkedInventoryType != (InventoryType)source.Container || offered->LinkedItemSlot != source.Slot) return false;
-                var actual = manager->GetInventorySlot((InventoryType)source.Container, source.Slot);
-                if (actual == null || Key(actual) != source.Item || actual->Quantity != source.Quantity) return false;
+                // GetInventorySlot resolves symbolic links and would return the bag source, losing trade quantity.
+                // Read only these five public raw slots. HandIn slot 5 is NOT assumed to be a gil slot.
+                var raw = container->Items + i;
+                var linkedContainer = raw->IsSymbolic ? (int)raw->LinkedInventoryType : -1;
+                var linkedSlot = raw->IsSymbolic ? (int)raw->LinkedItemSlot : -1;
+                var identity = raw->IsSymbolic ? ReadSource(linkedContainer, linkedSlot).Item : Key(raw);
+                working[i] = new(identity, raw->Quantity, raw->IsSymbolic, linkedContainer, linkedSlot);
             }
         }
-        return true;
+        return new(available, working, sources, ReadOffer(true).ToArray(), ReadOffer(false).ToArray(),
+            manager == null ? -1 : manager->TradeItemsLocal[5].Quantity,
+            manager == null ? -1 : manager->TradeItemsRemote[5].Quantity,
+            manager == null || manager->TradeIsSyncPending);
     }
+
+    private static BagSlot ReadSource(int bag, int slot)
+    {
+        // Never follow an unvalidated symbolic link or invoke its getter. Only normal player bags are sources.
+        if (bag is < 0 or > 3 || slot < 0) return new(bag, slot, default, -1);
+        var manager = InventoryManager.Instance();
+        var container = manager == null ? null : manager->GetInventoryContainer((InventoryType)bag);
+        if (container == null || container->Items == null || slot >= container->Size) return new(bag, slot, default, -1);
+        var source = container->Items + slot;
+        return source->IsSymbolic ? new(bag, slot, default, -1) : new(bag, slot, Key(source), source->Quantity);
+    }
+
+    private void RecordDiagnostic(string code, int slot = -1, TradeOfferSnapshot? view = null)
+    {
+        if (diagnosticRecorded) return;
+        diagnosticRecorded = true;
+        try
+        {
+            var canReadNative = !disposed && !framework.IsFrameworkUnloading && framework.IsInFrameworkUpdateThread && Compatible;
+            view ??= canReadNative ? CaptureOffers() : lastOfferView;
+            var manager = canReadNative ? InventoryManager.Instance() : null;
+            // Deliberately exclude identities, entity IDs, pointers, inventory-wide contents and exception text.
+            lastDiagnostic = JsonSerializer.Serialize(new
+            {
+                PluginVersion = typeof(Plugin).Assembly.GetName().Version?.ToString(), GameVersion = gameVersion ?? "unknown",
+                Code = code, Slot = slot < 0 ? (int?)null : slot + 1, Stage = stage.ToString(), filling, filled,
+                NativeSampleAvailable = canReadNative, numericSubmitted, NumericSeen = numericPointer != 0,
+                NumericVisible = canReadNative ? (bool?)Visible(InputNumeric) : null,
+                NumericMappingBound = numericMappingBound, MenuGenerationMatches = menuGeneration == expectedMenuGeneration,
+                OwnedWindowMatches = canReadNative ? (bool?)(ownedTradePointer != 0 && (nint)Trade == ownedTradePointer && ownedTradeGeneration == tradeGeneration) : null,
+                PartnerMatches = manager == null ? (bool?)null : manager->TradePartnerEntityId == recipient.Entity,
+                LocalState = manager == null ? "unavailable" : manager->TradeLocalState.ToString(),
+                RemoteState = manager == null ? "unavailable" : manager->TradeRemoteState.ToString(),
+                LastOfferCheck = lastOfferCheck.Code.ToString(), Plan = batch, Observation = view
+            }, new JsonSerializerOptions { WriteIndented = true });
+        }
+        catch (Exception ex) { lastDiagnostic = $"BatchTrade diagnostic capture failed: {ex.GetType().Name}; code={code}; stage={stage}"; }
+        log.Warning("BatchTrade stopped with diagnostic:\n{Diagnostic}", lastDiagnostic);
+    }
+
     private static ItemKey Key(InventoryItem* item) => new(item->ItemId, (item->Flags & InventoryItem.ItemFlags.HighQuality) != 0);
     private static List<BagSlot> ReadOffer(bool local)
     {
@@ -938,10 +1019,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
             for (var i = 0; i < 5; i++)
             {
                 var item = first + i;
-                // Local Trade items are symbolic links. Their raw ItemId/Flags are not the offered item.
-                // Resolve identity through official getters on the ORIGINAL native slot, never a struct copy.
-                // Quantity remains this Trade slot's selected amount (initially 1), not the source stack size.
-                var key = new ItemKey(item->GetBaseItemId(), (item->GetFlags() & InventoryItem.ItemFlags.HighQuality) != 0);
+                // The cache contains resolved source identity and a separately copied offered amount.
+                // Source-link authority belongs only to raw HandIn.Items[i], not this value view.
+                // Unexpected symbolic cache is not followed: positive quantity with unknown identity cannot match.
+                var key = item->IsSymbolic ? default : Key(item);
                 result.Add(new(0, i, key, item->Quantity));
             }
         }
