@@ -377,4 +377,59 @@ Check(FinalPromptRules.Check(null, false, finalText) == FinalPromptCheck.ValueUn
     "missing native values remain a distinct initialization state");
 Check(FinalPromptRules.Check("", true, "") == FinalPromptCheck.ExpectedTextMissing,
     "missing sheet text cannot authorize empty native prompt");
+// Groups describe an item's real stack size; slot caps and saved individual counts do not redefine a group.
+Check(TradeQuantityRules.TryParseCount("10", out var parsedCount) && parsedCount == 10,
+    "quantity text parses the complete positive integer");
+Check(TradeQuantityRules.TryParseCount("00010", out var leadingZeroCount) && leadingZeroCount == 10,
+    "leading zeroes preserve the exact numeric quantity");
+foreach (var invalidText in new string?[] { null, "", "0", "-1", "1.5", "4294967297", new('9', 128), "1e3", " 10", "+10", "１０", "10\0" })
+    Check(!TradeQuantityRules.TryParseCount(invalidText, out var rejectedCount) && rejectedCount == 0,
+        $"invalid numeric text cannot become a different positive quantity: {invalidText ?? "<null>"}");
+Check(TradeQuantityRules.TryResolve(QuantityInputMode.Groups, 2516, 10, 999, out var groupTotal) && groupTotal == 9990,
+    "ten groups of a 999-stack item resolve to 9990 items");
+Check(TradeQuantityRules.TryResolve(QuantityInputMode.Groups, 2516, 10, 99, out var groups99) && groups99 == 990,
+    "changing to a 99-stack item keeps ten groups and recalculates 990 items");
+Check(TradeQuantityRules.TryResolve(QuantityInputMode.Groups, 2516, 10, 1, out var groups1) && groups1 == 10,
+    "nonstackable items count as one item per group");
+Check(TradeQuantityRules.TryResolve(QuantityInputMode.Items, 2516, 10, 999, out var savedItems) && savedItems == 2516,
+    "switching back to individual mode retains the independent saved count");
+Check(TradeQuantityRules.TryResolve(QuantityInputMode.Items, 2516, -1, 0, out var itemsOnly) && itemsOnly == 2516,
+    "invalid inactive group input does not replace an individual quantity");
+Check(TradeQuantityRules.TryResolve(QuantityInputMode.Groups, -1, 2, 999, out var groupsOnly) && groupsOnly == 1998,
+    "group mode ignores inactive individual quantity");
+Check(!TradeQuantityRules.TryResolve(QuantityInputMode.Groups, 1, 0, 999, out _), "zero groups are rejected");
+Check(!TradeQuantityRules.TryResolve(QuantityInputMode.Groups, 1, -3, 999, out _), "negative groups are rejected");
+Check(!TradeQuantityRules.TryResolve(QuantityInputMode.Groups, 1, 10, 0, out _), "unknown stack size cannot authorize group trading");
+Check(!TradeQuantityRules.TryResolve((QuantityInputMode)99, 1, 1, 999, out _), "unknown quantity mode is rejected at execution");
+Check(!TradeQuantityRules.TryResolve(QuantityInputMode.Items, 0, 10, 999, out _), "zero individual amount remains invalid");
+Check(TradeQuantityRules.TryResolve(QuantityInputMode.Groups, 1, 10_000_000, 1, out var exactLimit) && exactLimit == 10_000_000,
+    "group conversion can reach the exact total safety limit");
+Check(!TradeQuantityRules.TryResolve(QuantityInputMode.Groups, 1, 10_000_001, 1, out var rejectedTotal) && rejectedTotal == 0,
+    "over-limit groups are refused rather than clamped into an authorized total");
+Check(TradeQuantityRules.TryResolve(QuantityInputMode.Groups, 1, 10010, 999, out var belowLimit) && belowLimit == 9_999_990,
+    "largest whole 999-stack group count below the limit is accepted");
+Check(!TradeQuantityRules.TryResolve(QuantityInputMode.Groups, 1, 10011, 999, out _), "next 999-stack group exceeds total limit");
+Check(!TradeQuantityRules.TryResolve(QuantityInputMode.Groups, 1, int.MaxValue, uint.MaxValue, out _),
+    "wide group multiplication cannot wrap into a valid small total");
+Check(TradeQuantityRules.TryResolve(QuantityInputMode.Groups, 1, 2, 9999, out var largeStack) && largeStack == 19998,
+    "group size is not silently limited to the per-trade-slot maximum");
+Check(!TradeQuantityRules.TryResolve(QuantityInputMode.Items, 10_000_001, 1, 999, out _), "execution also rejects oversized individual totals");
+Check(TradeQuantityRules.MigrateMode(3, QuantityInputMode.Groups) == QuantityInputMode.Items,
+    "old configurations retain individual-count semantics");
+Check(TradeQuantityRules.MigrateMode(4, QuantityInputMode.Groups) == QuantityInputMode.Groups,
+    "new configurations preserve group mode");
+Check(TradeQuantityRules.MigrateMode(4, (QuantityInputMode)42) == QuantityInputMode.Items,
+    "invalid saved mode loads as the legacy individual mode");
+var groupedKey = new ItemKey(42, false);
+var groupBags = Enumerable.Range(0, 10).Select(i => new BagSlot(0, i, groupedKey, 999)).ToArray();
+var groupFirst = TradeRules.Plan(groupBags, groupedKey, groupTotal, 999, 999);
+var groupSecond = TradeRules.Plan(groupBags.Skip(5).ToArray(), groupedKey, groupTotal - groupFirst.Sum(x => x.Quantity), 999, 999);
+Check(groupFirst.Count == 5 && groupSecond.Count == 5 && groupFirst.Sum(x => x.Quantity) + groupSecond.Sum(x => x.Quantity) == groupTotal,
+    "ten full groups retain five slots per transaction across two planned transactions");
+var restrictedGroup = TradeRules.Plan(groupBags, groupedKey, groupTotal, 99, 999);
+Check(restrictedGroup.Sum(x => x.Quantity) == 495 && groupTotal == 9990,
+    "a smaller slot cap affects batch distribution without shrinking group quantity");
+var partialGroup = TradeRules.Plan([new(0, 0, groupedKey, 600), new(0, 1, groupedKey, 399)], groupedKey, 999, 999, 999);
+Check(partialGroup.Sum(x => x.Quantity) == 999 && partialGroup.Count == 2,
+    "one group's total may come from multiple partially filled source stacks");
 Console.WriteLine($"PASS {checks} checks");

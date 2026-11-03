@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 
 namespace BatchTrade;
@@ -7,6 +8,44 @@ namespace BatchTrade;
 public readonly record struct ItemKey(uint Id, bool HighQuality);
 public readonly record struct BagSlot(int Container, int Slot, ItemKey Item, int Quantity);
 public readonly record struct PlannedSlot(BagSlot Source, int Quantity);
+
+public enum QuantityInputMode { Items, Groups }
+
+public static class TradeQuantityRules
+{
+    public const int MaximumTotal = 10_000_000;
+
+    // InputInt may accept numeric prefixes or wrap overflow before managed validation sees the value.
+    public static bool TryParseCount(string? text, out int count)
+    {
+        count = 0;
+        if (string.IsNullOrEmpty(text) || text.Any(c => c is < '0' or > '9')) return false;
+        if (!int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) || parsed <= 0) return false;
+        count = parsed;
+        return true;
+    }
+
+    // A group is the item's real stack size, independent of the user's per-trade-slot cap.
+    // Keep both saved inputs; only the selected mode contributes to this request.
+    public static bool TryResolve(QuantityInputMode mode, int itemCount, int groupCount, uint stackSize, out int total)
+    {
+        total = 0;
+        long quantity;
+        switch(mode)
+        {
+            case QuantityInputMode.Items: quantity = itemCount; break;
+            case QuantityInputMode.Groups when groupCount > 0 && stackSize > 0:
+                quantity = (long)groupCount * stackSize; break;
+            default: return false;
+        }
+        if(quantity is < 1 or > MaximumTotal) return false;
+        total = (int)quantity;
+        return true;
+    }
+
+    public static QuantityInputMode MigrateMode(int version, QuantityInputMode saved) =>
+        version >= 4 && saved is (QuantityInputMode.Items or QuantityInputMode.Groups) ? saved : QuantityInputMode.Items;
+}
 
 public enum InventoryChange { Unchanged, PartialExpectedDecrease, ExpectedDecrease, Unexpected }
 public enum CompletionResult { Waiting, Complete, Invalid }

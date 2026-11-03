@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Globalization;
 using System.Text.Json;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Configuration;
@@ -42,10 +43,12 @@ public sealed unsafe class Plugin : IDalamudPlugin
     [Serializable]
     public sealed class Config : IPluginConfiguration
     {
-        public int Version { get; set; } = 3;
+        public int Version { get; set; } = 4;
         public uint ItemId;
         public bool HighQuality;
         public int TotalQuantity = 1;
+        public QuantityInputMode QuantityMode = QuantityInputMode.Items;
+        public int GroupCount = 1;
         public int TimeoutSeconds = 90;
         public int SlotQuantityCap = 999;
         public int BatchQuantityCap = 999; // Legacy JSON field, read only while migrating versions before 3.
@@ -61,12 +64,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
         public int BetweenTradesMs = 1500;
     }
     private readonly record struct Identity(uint Entity, string Name, ushort World);
-    private readonly record struct StartRequest(uint ItemId, bool HighQuality, int TotalQuantity, int TimeoutSeconds, int SlotQuantityCap, TradeDelays Delays, Identity? Target);
+    private readonly record struct StartRequest(uint ItemId, bool HighQuality, QuantityInputMode QuantityMode, int TotalQuantity, int GroupCount,
+        int TimeoutSeconds, int SlotQuantityCap, TradeDelays Delays, Identity? Target);
     private sealed record UiSnapshot(bool Running, bool Cancelling, bool FinalSubmitted, int Goal, int Delivered,
         string RecipientLabel, Identity? Target, uint[] ItemIds, IReadOnlyDictionary<ItemKey, long> Totals, string Status, string DelayLabel, int DelayRemainingMs, string LastDiagnostic);
     private UiSnapshot uiSnapshot = new(false, false, false, 0, 0, "", null, [], new Dictionary<ItemKey, long>(),
         "请选择物品、品质和总数量，然后选中接收玩家。", "", 0, "");
     private Config config = null!;
+    private string itemCountInput = "1", groupCountInput = "1";
     private Stage stage;
     private ItemKey selected;
     private Identity recipient;
@@ -118,12 +123,16 @@ public sealed unsafe class Plugin : IDalamudPlugin
         try { gameVersion = data.GameData.Repositories.TryGetValue("ffxiv", out var repository) ? repository.Version?.Trim() : null; }
         catch { gameVersion = null; }
         config = pluginInterface.GetPluginConfig() as Config ?? new Config();
-        config.TotalQuantity = Math.Clamp(config.TotalQuantity, 1, 10_000_000);
+        itemCountInput = config.TotalQuantity.ToString(CultureInfo.InvariantCulture);
+        groupCountInput = config.GroupCount.ToString(CultureInfo.InvariantCulture);
         config.TimeoutSeconds = Math.Clamp(config.TimeoutSeconds, 15, 600);
         var migratedSlotCap = TradeRules.MigrateSlotQuantityCap(config.Version, config.SlotQuantityCap, config.BatchQuantityCap);
         var saveMigratedConfig = config.Version < 3 || config.SlotQuantityCap != migratedSlotCap;
         config.SlotQuantityCap = migratedSlotCap;
-        config.Version = 3;
+        var migratedMode = TradeQuantityRules.MigrateMode(config.Version, config.QuantityMode);
+        saveMigratedConfig |= config.Version < 4 || config.QuantityMode != migratedMode;
+        config.QuantityMode = migratedMode;
+        config.Version = 4;
         if (saveMigratedConfig) SaveConfig();
         config.StartupDelayMs = Math.Clamp(config.StartupDelayMs, 0, 600_000);
         config.BetweenTradesMs = Math.Clamp(config.BetweenTradesMs, 0, 600_000);
@@ -193,7 +202,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void QueueStart(UiSnapshot snapshot)
     {
-        var request = new StartRequest(config.ItemId, config.HighQuality, config.TotalQuantity, config.TimeoutSeconds, config.SlotQuantityCap,
+        var request = new StartRequest(config.ItemId, config.HighQuality, config.QuantityMode, config.TotalQuantity, config.GroupCount,
+            config.TimeoutSeconds, config.SlotQuantityCap,
             new TradeDelays(config.StartupDelayMs, config.RequestDelayMs, config.OpenMenuDelayMs, config.SelectMenuDelayMs,
                 config.QuantityDelayMs, config.CloseMenuDelayMs, config.ProposeDelayMs,
                 config.FinalConfirmDelayMs, config.CancelDelayMs, config.BetweenTradesMs).Normalize(), snapshot.Target);
@@ -271,9 +281,39 @@ public sealed unsafe class Plugin : IDalamudPlugin
             ImGui.EndCombo();
         }
         if (ImGui.Checkbox("只交易高品质 HQ（未勾选为 NQ）", ref config.HighQuality)) SaveConfig();
-        ImGui.InputInt("交易总数量", ref config.TotalQuantity);
-        if (ImGui.IsItemDeactivatedAfterEdit())
-        { config.TotalQuantity = Math.Clamp(config.TotalQuantity, 1, 10_000_000); SaveConfig(); }
+        if (ImGui.RadioButton("按个数", config.QuantityMode == QuantityInputMode.Items))
+        { config.QuantityMode = QuantityInputMode.Items; SaveConfig(); }
+        ImGui.SameLine();
+        if (ImGui.RadioButton("按组数", config.QuantityMode == QuantityInputMode.Groups))
+        { config.QuantityMode = QuantityInputMode.Groups; SaveConfig(); }
+        bool validInput;
+        if (config.QuantityMode == QuantityInputMode.Groups)
+        {
+            ImGui.InputText("交易组数（整组）", ref groupCountInput, 128);
+            validInput = TradeQuantityRules.TryParseCount(groupCountInput, out var countInput);
+            if (validInput) config.GroupCount = countInput;
+            if (ImGui.IsItemDeactivatedAfterEdit() && validInput) SaveConfig();
+        }
+        else
+        {
+            ImGui.InputText("交易总数量（个）", ref itemCountInput, 128);
+            validInput = TradeQuantityRules.TryParseCount(itemCountInput, out var countInput);
+            if (validInput) config.TotalQuantity = countInput;
+            if (ImGui.IsItemDeactivatedAfterEdit() && validInput) SaveConfig();
+        }
+        var stackSize = data.GetExcelSheet<Item>()?.GetRowOrDefault(config.ItemId)?.StackSize ?? 0;
+        var previewTotal = 0;
+        var validQuantity = validInput && TradeQuantityRules.TryResolve(config.QuantityMode, config.TotalQuantity, config.GroupCount, stackSize, out previewTotal);
+        if (config.QuantityMode == QuantityInputMode.Groups)
+        {
+            if (stackSize > 0 && validInput)
+                ImGui.TextWrapped($"交易总量：{config.GroupCount:N0} 组 × {stackSize:N0} 个/组 = {(long)config.GroupCount * stackSize:N0} 个。");
+            else if (stackSize == 0) ImGui.TextWrapped("请先选择物品，以读取每组的个数。");
+            ImGui.TextWrapped("每组个数自动取物品堆叠上限；每格交易上限只控制分装，不改变组的大小。");
+        }
+        else if (validQuantity) ImGui.TextUnformatted($"交易总量：{previewTotal:N0} 个。");
+        if (!validQuantity && config.ItemId != 0)
+            ImGui.TextWrapped("数量无效：请只填写 0–9 数字组成的正整数，换算后的总量须为 1–10,000,000 个；不会自动截断或缩减。");
         ImGui.InputInt("每笔等待超时（秒）", ref config.TimeoutSeconds);
         if (ImGui.IsItemDeactivatedAfterEdit())
         { config.TimeoutSeconds = Math.Clamp(config.TimeoutSeconds, 15, 600); SaveConfig(); }
@@ -297,7 +337,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
         ImGui.TextUnformatted(target is null ? "当前目标：请在游戏中选中一名玩家" : $"当前目标：{target.Value.Name}（世界 #{target.Value.World}）");
         var count = snapshot.Totals.GetValueOrDefault(new(config.ItemId, config.HighQuality));
         ImGui.TextUnformatted($"该品质背包可用数量：{count}");
+        ImGui.BeginDisabled(!validQuantity || config.ItemId == 0);
         if (ImGui.Button("开始批量交易")) QueueStart(snapshot);
+        ImGui.EndDisabled();
         ImGui.EndDisabled();
         if (snapshot.Running || pending && !snapshot.Cancelling)
         {
@@ -372,14 +414,17 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var manager = InventoryManager.Instance();
         if (manager == null || manager->TradeLocalState > TradeState.NotTrading || Visible(Trade) || Visible(SelectYesno) || Visible(InputNumeric) || Visible(ContextAddon))
         { status = "请先结束已有交易并关闭确认、数量和右键菜单窗口。"; return; }
-        if (request.ItemId == 0 || request.TotalQuantity <= 0 || data.GetExcelSheet<Item>()?.GetRowOrDefault(request.ItemId) is not { } item || item.IsUntradable)
-        { status = "请选择可交易物品并填写大于 0 的总数量。"; return; }
+        if (request.ItemId == 0 || data.GetExcelSheet<Item>()?.GetRowOrDefault(request.ItemId) is not { } item || item.IsUntradable)
+        { status = "请选择可交易物品。"; return; }
+        // Re-read the selected item's stack size on the framework thread; never use the editable slot cap as group size.
+        if (!TradeQuantityRules.TryResolve(request.QuantityMode, request.TotalQuantity, request.GroupCount, item.StackSize, out var totalQuantity))
+        { status = "数量无效：请输入正整数，换算后的总量须为 1–10,000,000 个。"; return; }
         selected = new(request.ItemId, request.HighQuality);
         baseline = TradeRules.Totals(ReadInventory());
-        if (baseline.GetValueOrDefault(selected) < request.TotalQuantity)
+        if (baseline.GetValueOrDefault(selected) < totalQuantity)
         { status = "该品质物品数量不足，请调整总数量或品质。"; return; }
         diagnosticRecorded = false; lastOfferView = null; lastDiagnostic = "";
-        sender = Describe(local); recipient = target; goal = request.TotalQuantity; delivered = 0;
+        sender = Describe(local); recipient = target; goal = totalQuantity; delivered = 0;
         activeTimeoutSeconds = Math.Clamp(request.TimeoutSeconds, 15, 600);
         activeSlotCap = Math.Clamp(request.SlotQuantityCap, 1, 999);
         activeStackLimit = (int)Math.Clamp((long)item.StackSize, 1, int.MaxValue);
@@ -387,7 +432,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
         initialGil = manager->GetGil();
         stage = Stage.Starting;
         clock.BeginDelay(Now, activeDelays.Startup);
-        status = $"已锁定接收方，启动延迟后开始；每格最多 {activeSlotCap} 个，每笔最多 5 格。";
+        var quantityLabel = request.QuantityMode == QuantityInputMode.Groups
+            ? $"{request.GroupCount:N0} 组 × {item.StackSize:N0} = {goal:N0} 个" : $"{goal:N0} 个";
+        status = $"已锁定接收方和总量 {quantityLabel}，启动延迟后开始；每格最多 {activeSlotCap} 个，每笔最多 5 格。";
     }
 
     private bool CheckIdentity()
