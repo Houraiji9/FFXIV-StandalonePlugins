@@ -46,7 +46,7 @@ partial[item] = 301;
 Check(TradeRules.ClassifySettlement(before, partial, item, 198) == InventoryChange.Unexpected, "too much sent rejected");
 partial[item] = 501;
 Check(TradeRules.ClassifySettlement(before, partial, item, 198) == InventoryChange.Unexpected, "unexpected receiving rejected");
-// User report: 3,259 units must be separated by total-per-trade cap, not per-slot cap.
+// Per-slot cap: a transaction can use up to five distinct source stacks.
 List<int> SimulateBatches(int cap)
 {
     var inventory = new List<BagSlot> { new(0, 0, item, 999), new(0, 1, item, 999), new(0, 2, item, 999), new(0, 3, item, 262) };
@@ -67,13 +67,13 @@ List<int> SimulateBatches(int cap)
     }
     return results;
 }
-Check(SimulateBatches(999).SequenceEqual(new[] { 999, 999, 999, 262 }), "3259 splits into 999 999 999 262");
+Check(SimulateBatches(999).SequenceEqual(new[] { 3259 }), "3259 fits in four slots of one transaction");
 var capped99 = SimulateBatches(99);
-Check(capped99.Count == 33 && capped99.Take(32).All(x => x == 99) && capped99[^1] == 91, "cap99 exact remainder");
+Check(capped99.Count == 11 && capped99.Sum() == 3259 && capped99.All(x => x <= 4 * 99), "cap99 limits individual slots rather than transaction total");
 var capped1 = SimulateBatches(1);
-Check(capped1.Count == 3259 && capped1.All(x => x == 1), "cap1 never batches multiple units");
+Check(capped1.Count == 999 && capped1.Sum() == 3259 && capped1.All(x => x is >= 1 and <= 4), "cap1 permits one unit from each distinct source per transaction");
 plan = TradeRules.Plan(slots, item, 1000, 150, 99);
-Check(plan.Count == 2 && plan.Sum(x => x.Quantity) == 150 && plan[1].Quantity == 51, "cap is total across all physical slots");
+Check(plan.Count == 5 && plan.All(x => x.Quantity == 99), "native item stack limit applies independently to all five slots");
 plan = TradeRules.Plan(Enumerable.Range(0, 8).Select(i => new BagSlot(0, i, item, 1)).ToList(), item, 8, 999, 1);
 Check(plan.Count == 5 && plan.Sum(x => x.Quantity) == 5, "nonstackable items remain limited to five physical slots");
 Check(TradeRules.Plan([new(0, 0, item, 999)], item, 999, 999, 99).Single().Quantity == 99, "per-slot stack limit preserved");
@@ -87,7 +87,7 @@ foreach (var invalid in new[] { 0, 1000 })
 
 var popup = new NumericPopupState(true, true, true, PopupOwner.InventoryQuantity, true, true, 1, 999, 999, 9999, 9999, 999);
 Check(NumericPopupRules.Check(popup) == NumericCheck.Ready, "numeric max may be 999 while source quantity is larger");
-Check(NumericPopupRules.Check(popup with { Amount = 99, RemainingBatchCap = 99 }) == NumericCheck.Ready, "numeric slider can exceed chosen cap while submitted amount cannot");
+Check(NumericPopupRules.Check(popup with { Amount = 99, SlotQuantityCap = 99 }) == NumericCheck.Ready, "numeric slider can exceed chosen cap while submitted amount cannot");
 Check(NumericPopupRules.Check(popup with { Owner = PopupOwner.Missing }) == NumericCheck.OwnerMissing, "missing registration is distinct from wrong ownership");
 Check(NumericPopupRules.Check(popup with { Owner = PopupOwner.Other }) == NumericCheck.OwnerUnexpected, "arbitrary or agent-owned numeric dialog rejected");
 Check(NumericPopupRules.Check(popup with { Owner = PopupOwner.InventoryFinal }) == NumericCheck.OwnerUnexpected, "final confirmation receiver is not a quantity receiver");
@@ -174,7 +174,7 @@ Check(!TradeRules.PendingSlotMatches(Offer(new BagSlot(0, 0, item, 98), new(0, 1
 Check(!TradeRules.PendingSlotMatches(Offer(new BagSlot(0, 0, item, 99), new(0, 1, hq, 1)), twoPlan, 1, item, 0, false), "temporary slot wrong quality rejected");
 Check(!TradeRules.PendingSlotMatches(Offer(new BagSlot(0, 0, item, 1), new(0, 1, other, 1)), partialPlan, 0, item, 0, false), "unexpected additional slot rejected");
 Check(!TradeRules.PendingSlotMatches(temporaryOne, partialPlan, 0, item, 1, false), "gil cannot hide behind pending numeric");
-Check(NumericPopupRules.Check(popup with { Amount = 99, SourceQuantity = 99, ItemStackLimit = 99, Maximum = 999, RemainingBatchCap = 99 }) == NumericCheck.Ready,
+Check(NumericPopupRules.Check(popup with { Amount = 99, SourceQuantity = 99, ItemStackLimit = 99, Maximum = 999, SlotQuantityCap = 99 }) == NumericCheck.Ready,
     "popup upper range may exceed source but the planned submission never does");
 Check(GameCompatibility.IsSupported("2026.10.06.0000.0000\r\n", 0x3730), "version file trailing newline normalized before exact check");
 // v0.1.2 reproduces the native dual view: raw HandIn slots are symbolic, local cache is resolved.
@@ -271,4 +271,72 @@ var diagnostic = System.Text.Json.JsonSerializer.Serialize(new { Plan = partialP
 Check(diagnostic.Contains("RawWorking") && diagnostic.Contains("LocalCache") && diagnostic.Contains("Sources") &&
       !diagnostic.Contains("Entity") && !diagnostic.Contains("Pointer") && !diagnostic.Contains("Name"),
     "offer diagnostic exposes both views and source evidence without identity or pointer fields");
+// v0.1.3: the user's 999 limit applies to each physical trade slot, not their sum.
+var mixedSources = new List<BagSlot> { new(0, 0, item, 518), new(0, 1, item, 999), new(0, 2, item, 999) };
+var wholeTrade = TradeRules.Plan(mixedSources, item, 2516, 999, 999);
+Check(wholeTrade.Select(x => x.Quantity).SequenceEqual(new[] { 999, 999, 518 }), "2516 is sent as999+999+518 in one transaction");
+Check(wholeTrade.Select(x => x.Source.Slot).SequenceEqual(new[] { 1, 2, 0 }), "larger stacks first preserve exact original bag source mapping");
+var tieSources = new List<BagSlot> { new(1, 5, item, 999), new(0, 2, item, 999), new(0, 1, item, 999) };
+Check(TradeRules.Plan(tieSources, item, 2997).Select(x => (x.Source.Container, x.Source.Slot))
+    .SequenceEqual(new[] { (0, 1), (0, 2), (1, 5) }), "equal stack sizes use stable bag and slot order independent of input order");
+var sixSources = Enumerable.Range(0, 6).Select(i => new BagSlot(0, i, item, 999)).ToList();
+var firstFive = TradeRules.Plan(sixSources, item, 5994);
+Check(firstFive.Count == 5 && firstFive.Sum(x => x.Quantity) == 4995, "five full999 slots share one4995 transaction");
+var afterFive = sixSources.Select(s => s with { Quantity = s.Slot < 5 ? 0 : s.Quantity }).ToList();
+Check(TradeRules.Plan(afterFive, item, 999).Single().Source.Slot == 5, "sixth source remains for a subsequent transaction");
+var threeAt99 = TradeRules.Plan(mixedSources, item, 2516, 99, 999);
+Check(threeAt99.Count == 3 && threeAt99.Sum(x => x.Quantity) == 297 && threeAt99.All(x => x.Quantity == 99),
+    "cap99 allows three independent99 slots in one transaction");
+var threeAt1 = TradeRules.Plan(mixedSources, item, 2516, 1, 999);
+Check(threeAt1.Count == 3 && threeAt1.Sum(x => x.Quantity) == 3 && threeAt1.All(x => x.Quantity == 1),
+    "cap1 permits one unit per distinct source slot");
+Check(TradeRules.Plan([new(0, 0, item, 999)], item, 495, 99, 999).Single().Quantity == 99,
+    "one source cannot be reused to fill five trade slots with99 each");
+Check(TradeRules.Plan([new(0, 0, item, 999), new(0, 0, item, 999)], item, 1998).Count == 1,
+    "duplicate input references to one physical source are deduplicated");
+Check(TradeRules.Plan(mixedSources, item, 1200).Select(x => x.Quantity).SequenceEqual(new[] { 999, 201 }),
+    "goal remainder controls the final slot independently of slot cap");
+Check(TradeRules.Plan(mixedSources.Append(new BagSlot(2, 10, hq, 999)).ToArray(), item, 2516).All(x => x.Source.Item == item),
+    "descending source order never crosses selected quality");
+Check(TradeRules.Plan([new(2, 10, hq, 999), new(0, 0, item, 999)], hq, 500).Single().Quantity == 500,
+    "HQ partial source stays independent of NQ inventory");
+var numericEachSlot = wholeTrade.Select(x => NumericPopupRules.Check(popup with
+{
+    Amount = x.Quantity, SourceQuantity = x.Source.Quantity, SlotQuantityCap = 999, ItemStackLimit = 999
+})).ToArray();
+Check(numericEachSlot.SequenceEqual(new[] { NumericCheck.Ready, NumericCheck.Ready, NumericCheck.Ready }),
+    "second and third numeric submissions retain full per-slot allowance after999 or1998 already filled");
+Check(NumericPopupRules.Check(popup with { Amount = 100, SlotQuantityCap = 99 }) == NumericCheck.InvalidRange,
+    "each later slot still rejects amount above its own configured cap");
+var threeSlots = View(wholeTrade, 999, 999, 1);
+Check(TradeOfferRules.Check(threeSlots, wholeTrade, 2, true).Code == OfferCheckCode.QuantityReady,
+    "third sorted source retains raw link authority and temporary1 before its own numeric submission");
+threeSlots = View(wholeTrade, 999, 999, 518);
+Check(TradeOfferRules.Check(threeSlots, wholeTrade, 2, true, true).Code == OfferCheckCode.Ready &&
+      TradeOfferRules.Check(threeSlots, wholeTrade, 3).Code == OfferCheckCode.Ready,
+    "all three sorted slots reconcile through unchanged dual-view rules");
+var largerBefore = new Dictionary<ItemKey, long> { [item] = 2516, [hq] = 25 };
+var largerPartial = new Dictionary<ItemKey, long> { [item] = 1517, [hq] = 25 };
+var largerAfter = new Dictionary<ItemKey, long> { [item] = 0, [hq] = 25 };
+Check(TradeRules.ClassifySettlement(largerBefore, largerPartial, item, 2516) == InventoryChange.PartialExpectedDecrease &&
+      TradeRules.ClassifySettlement(largerBefore, largerAfter, item, 2516) == InventoryChange.ExpectedDecrease,
+    "multi-slot2516 settlement accepts partial per-slot updates then exact total delta");
+Check(CompletionGate.Evaluate(true, TradeRules.ClassifySettlement(largerBefore, largerAfter, item, 2516), false) == CompletionResult.Waiting &&
+      CompletionGate.Evaluate(true, TradeRules.ClassifySettlement(largerBefore, largerAfter, item, 2516), true) == CompletionResult.Complete,
+    "larger transaction still needs all three independent completion signals");
+Check(TradeRules.MigrateSlotQuantityCap(2, 999, 99) == 99, "legacy user cap migrates to per-slot setting");
+Check(TradeRules.MigrateSlotQuantityCap(2, 999, 1) == 1, "legacy minimum cap is preserved");
+Check(TradeRules.MigrateSlotQuantityCap(3, 500, 99) == 500, "migrated config never lets stale legacy field overwrite new setting");
+Check(TradeRules.MigrateSlotQuantityCap(1, 999, 0) == 1 && TradeRules.MigrateSlotQuantityCap(2, 999, 1500) == 999,
+    "legacy invalid caps normalize to supported range");
+var crossBagPlan = TradeRules.Plan([new(2, 9, item, 518), new(1, 4, item, 999), new(0, 20, item, 999)], item, 2516);
+Check(crossBagPlan.Select(x => (x.Source.Container, x.Source.Slot, x.Quantity))
+    .SequenceEqual(new[] { (0, 20, 999), (1, 4, 999), (2, 9, 518) }),
+    "sorted trade positions retain cross-bag source coordinates rather than natural inventory indices");
+var crossBagView = View(crossBagPlan, 999, 999, 1);
+Check(TradeOfferRules.Check(crossBagView, crossBagPlan, 2, true).Code == OfferCheckCode.QuantityReady,
+    "third trade position correctly binds original bag2 slot9 after sorted fills");
+crossBagView.RawWorking[2] = crossBagView.RawWorking[2] with { LinkedContainer = 0, LinkedSlot = 2 };
+Check(TradeOfferRules.Check(crossBagView, crossBagPlan, 2, true).Code == OfferCheckCode.SourceContainer,
+    "using target trade index as a source bag slot still fails source authority check");
 Console.WriteLine($"PASS {checks} checks");

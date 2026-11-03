@@ -15,7 +15,7 @@ public enum NumericCheck { Ready, ActionNotBound, SourceChanged, TradeChanged, O
 
 public readonly record struct NumericPopupState(bool ActionBound, bool SourceMatches, bool TradeMatches,
     PopupOwner Owner, bool MappingUnchanged, bool PromptMatches, int Minimum, int Maximum,
-    int Amount, int SourceQuantity, int ItemStackLimit, int RemainingBatchCap);
+    int Amount, int SourceQuantity, int ItemStackLimit, int SlotQuantityCap);
 
 public static class NumericPopupRules
 {
@@ -28,7 +28,7 @@ public static class NumericPopupRules
         if (state.Owner != PopupOwner.InventoryQuantity) return NumericCheck.OwnerUnexpected;
         if (!state.MappingUnchanged) return NumericCheck.MappingChanged;
         if (!state.PromptMatches) return NumericCheck.PromptMismatch;
-        var limit = Math.Min(state.SourceQuantity, Math.Min(state.ItemStackLimit, state.RemainingBatchCap));
+        var limit = Math.Min(state.SourceQuantity, Math.Min(state.ItemStackLimit, state.SlotQuantityCap));
         return state.Minimum >= 0 && state.Maximum >= state.Minimum && state.Amount >= Math.Max(1, state.Minimum) &&
             state.Amount <= state.Maximum && state.Amount <= limit
                 ? NumericCheck.Ready : NumericCheck.InvalidRange;
@@ -114,6 +114,9 @@ public static class CompletionGate
 /// <summary>Pure planning and validation; contains no game access.</summary>
 public static class TradeRules
 {
+    public static int MigrateSlotQuantityCap(int configVersion, int slotQuantityCap, int legacyBatchQuantityCap) =>
+        Math.Clamp(configVersion < 3 ? legacyBatchQuantityCap : slotQuantityCap, 1, 999);
+
     public static bool PendingSlotMatches(IReadOnlyList<BagSlot> offered, IReadOnlyList<PlannedSlot> plan,
         int filling, ItemKey selected, int gil, bool quantitySubmitted)
     {
@@ -143,16 +146,18 @@ public static class TradeRules
         offered[filling].Item == selected && offered[filling].Quantity == plan[filling].Quantity;
 
     public static List<PlannedSlot> Plan(IReadOnlyList<BagSlot> inventory, ItemKey item, int remaining,
-        int batchCap = 999, int itemStackLimit = 999)
+        int slotQuantityCap = 999, int itemStackLimit = 999)
     {
         if (item.Id == 0 || remaining <= 0) throw new ArgumentOutOfRangeException(nameof(remaining));
-        if (batchCap is < 1 or > 999 || itemStackLimit < 1) throw new ArgumentOutOfRangeException(nameof(batchCap));
-        remaining = Math.Min(remaining, batchCap);
+        if (slotQuantityCap is < 1 or > 999 || itemStackLimit < 1) throw new ArgumentOutOfRangeException(nameof(slotQuantityCap));
         var result = new List<PlannedSlot>(5);
-        foreach (var slot in inventory)
+        // Use larger existing stacks first, with stable bag/slot order for ties. Each source is linked
+        // at most once per trade; splitting or reusing its remainder needs another completed transaction.
+        foreach (var slot in inventory.Where(s => s.Item == item && s.Quantity > 0)
+                     .OrderByDescending(s => s.Quantity).ThenBy(s => s.Container).ThenBy(s => s.Slot)
+                     .DistinctBy(s => (s.Container, s.Slot)))
         {
-            if (slot.Item != item || slot.Quantity <= 0) continue;
-            var amount = Math.Min(slot.Quantity, Math.Min(remaining, itemStackLimit));
+            var amount = Math.Min(slot.Quantity, Math.Min(remaining, Math.Min(slotQuantityCap, itemStackLimit)));
             result.Add(new(slot, amount));
             remaining -= amount;
             if (remaining == 0 || result.Count == 5) break;

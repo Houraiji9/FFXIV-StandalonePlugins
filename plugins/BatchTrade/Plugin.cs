@@ -42,12 +42,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
     [Serializable]
     public sealed class Config : IPluginConfiguration
     {
-        public int Version { get; set; } = 2;
+        public int Version { get; set; } = 3;
         public uint ItemId;
         public bool HighQuality;
         public int TotalQuantity = 1;
         public int TimeoutSeconds = 90;
-        public int BatchQuantityCap = 999;
+        public int SlotQuantityCap = 999;
+        public int BatchQuantityCap = 999; // Legacy JSON field, read only while migrating versions before 3.
         public int StartupDelayMs = 1000;
         public int RequestDelayMs = 800;
         public int OpenMenuDelayMs = 500;
@@ -60,7 +61,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         public int BetweenTradesMs = 1500;
     }
     private readonly record struct Identity(uint Entity, string Name, ushort World);
-    private readonly record struct StartRequest(uint ItemId, bool HighQuality, int TotalQuantity, int TimeoutSeconds, int BatchQuantityCap, TradeDelays Delays, Identity? Target);
+    private readonly record struct StartRequest(uint ItemId, bool HighQuality, int TotalQuantity, int TimeoutSeconds, int SlotQuantityCap, TradeDelays Delays, Identity? Target);
     private sealed record UiSnapshot(bool Running, bool Cancelling, bool FinalSubmitted, int Goal, int Delivered,
         string RecipientLabel, Identity? Target, uint[] ItemIds, IReadOnlyDictionary<ItemKey, long> Totals, string Status, string DelayLabel, int DelayRemainingMs, string LastDiagnostic);
     private UiSnapshot uiSnapshot = new(false, false, false, 0, 0, "", null, [], new Dictionary<ItemKey, long>(),
@@ -72,7 +73,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private Identity sender;
     private int goal, delivered, filling, filled, batchQuantity, activeTimeoutSeconds;
     private readonly TradeClock clock = new();
-    private int activeBatchCap, activeStackLimit;
+    private int activeSlotCap, activeStackLimit;
     private TradeDelays activeDelays;
     private long updateFrame, tradeGeneration, menuGeneration, expectedMenuGeneration, numericMenuGeneration;
     private nint ownedTradePointer;
@@ -117,7 +118,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
         config = pluginInterface.GetPluginConfig() as Config ?? new Config();
         config.TotalQuantity = Math.Clamp(config.TotalQuantity, 1, 10_000_000);
         config.TimeoutSeconds = Math.Clamp(config.TimeoutSeconds, 15, 600);
-        config.BatchQuantityCap = Math.Clamp(config.BatchQuantityCap, 1, 999);
+        var migratedSlotCap = TradeRules.MigrateSlotQuantityCap(config.Version, config.SlotQuantityCap, config.BatchQuantityCap);
+        var saveMigratedConfig = config.Version < 3 || config.SlotQuantityCap != migratedSlotCap;
+        config.SlotQuantityCap = migratedSlotCap;
+        config.Version = 3;
+        if (saveMigratedConfig) SaveConfig();
         config.StartupDelayMs = Math.Clamp(config.StartupDelayMs, 0, 600_000);
         config.BetweenTradesMs = Math.Clamp(config.BetweenTradesMs, 0, 600_000);
         commands.AddHandler("/batchtrade", new CommandInfo(OnCommand) { HelpMessage = "打开批量物品交易设置；/batchtrade stop 停止任务。" });
@@ -186,7 +191,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void QueueStart(UiSnapshot snapshot)
     {
-        var request = new StartRequest(config.ItemId, config.HighQuality, config.TotalQuantity, config.TimeoutSeconds, config.BatchQuantityCap,
+        var request = new StartRequest(config.ItemId, config.HighQuality, config.TotalQuantity, config.TimeoutSeconds, config.SlotQuantityCap,
             new TradeDelays(config.StartupDelayMs, config.RequestDelayMs, config.OpenMenuDelayMs, config.SelectMenuDelayMs,
                 config.QuantityDelayMs, config.CloseMenuDelayMs, config.ProposeDelayMs,
                 config.FinalConfirmDelayMs, config.CancelDelayMs, config.BetweenTradesMs).Normalize(), snapshot.Target);
@@ -270,8 +275,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         ImGui.InputInt("每笔等待超时（秒）", ref config.TimeoutSeconds);
         if (ImGui.IsItemDeactivatedAfterEdit())
         { config.TimeoutSeconds = Math.Clamp(config.TimeoutSeconds, 15, 600); SaveConfig(); }
-        EditBoundedInt("单笔总数量上限（1–999）", ref config.BatchQuantityCap, 1, 999);
-        ImGui.TextWrapped("上限按整笔所有物品格合计；每笔仍最多 5 个物理格。");
+        EditBoundedInt("每格数量上限（1–999）", ref config.SlotQuantityCap, 1, 999);
+        ImGui.TextWrapped("每笔最多 5 格，按数量从大到小选择背包堆。每个源背包格每笔只使用一次；不会自动拆分背包堆叠。");
         if (ImGui.CollapsingHeader("各步骤延迟（毫秒）"))
         {
             EditBoundedInt("启动延迟", ref config.StartupDelayMs, 0, 600_000);
@@ -374,13 +379,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
         diagnosticRecorded = false; lastOfferView = null; lastDiagnostic = "";
         sender = Describe(local); recipient = target; goal = request.TotalQuantity; delivered = 0;
         activeTimeoutSeconds = Math.Clamp(request.TimeoutSeconds, 15, 600);
-        activeBatchCap = Math.Clamp(request.BatchQuantityCap, 1, 999);
+        activeSlotCap = Math.Clamp(request.SlotQuantityCap, 1, 999);
         activeStackLimit = (int)Math.Clamp((long)item.StackSize, 1, int.MaxValue);
         activeDelays = request.Delays;
         initialGil = manager->GetGil();
         stage = Stage.Starting;
         clock.BeginDelay(Now, activeDelays.Startup);
-        status = $"已锁定接收方，启动延迟后开始；单笔总量不超过 {activeBatchCap} 个。";
+        status = $"已锁定接收方，启动延迟后开始；每格最多 {activeSlotCap} 个，每笔最多 5 格。";
     }
 
     private bool CheckIdentity()
@@ -400,7 +405,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var inventory = ReadInventory();
         if (!TradeRules.SameInventory(baseline, TradeRules.Totals(inventory), selected))
         { Stop("背包在两笔交易之间发生了变化，已停止。", true); return; }
-        batch = TradeRules.Plan(inventory, selected, goal - delivered, activeBatchCap, activeStackLimit);
+        batch = TradeRules.Plan(inventory, selected, goal - delivered, activeSlotCap, activeStackLimit);
         if (batch.Count == 0) { Stop("没有足够的可用物品，已停止。", true); return; }
         batchQuantity = batch.Sum(x => x.Quantity); filling = 0; filled = 0;
         completionMessage = finalSubmitted = numericSubmitted = settlementWindowStarted = false;
@@ -624,7 +629,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var evidence = new NumericPopupState(numericMenuGeneration == expectedMenuGeneration && menuGeneration == expectedMenuGeneration,
             sourceMatches, Visible(Trade) && manager->TradePartnerEntityId == recipient.Entity && manager->TradeLocalState == TradeState.SelectingTradeGoods,
             owner, !numericMappingBound || receiver == numericReceiver && kind == numericEventKind,
-            IsTradeQuantityPrompt(numeric), minimum, maximum, amount, planned.Source.Quantity, activeStackLimit, activeBatchCap - filled);
+            IsTradeQuantityPrompt(numeric), minimum, maximum, amount, planned.Source.Quantity, activeStackLimit, activeSlotCap);
         var result = NumericPopupRules.Check(evidence);
         if (result != NumericCheck.Ready)
         {
@@ -993,7 +998,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             lastDiagnostic = JsonSerializer.Serialize(new
             {
                 PluginVersion = typeof(Plugin).Assembly.GetName().Version?.ToString(), GameVersion = gameVersion ?? "unknown",
-                Code = code, Slot = slot < 0 ? (int?)null : slot + 1, Stage = stage.ToString(), filling, filled,
+                Code = code, Slot = slot < 0 ? (int?)null : slot + 1, Stage = stage.ToString(), filling, filled, activeSlotCap,
                 NativeSampleAvailable = canReadNative, numericSubmitted, NumericSeen = numericPointer != 0,
                 NumericVisible = canReadNative ? (bool?)Visible(InputNumeric) : null,
                 NumericMappingBound = numericMappingBound, MenuGenerationMatches = menuGeneration == expectedMenuGeneration,
