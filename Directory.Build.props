@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <DebugSymbols Condition="'$(Configuration)' == 'Release'">false</DebugSymbols>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    <DalamudLibPath Condition="'$(DalamudLibPath)' == '' and '$(DALAMUD_HOME)' != ''">$(DALAMUD_HOME)</DalamudLibPath>
+    <DalamudLibPath Condition="'$(DalamudLibPath)' == '' and Exists('$(MSBuildThisFileDirectory).sdk/dalamud-26-11-03-01/Dalamud.dll')">$(MSBuildThisFileDirectory).sdk/dalamud-26-11-03-01</DalamudLibPath>
+    <DalamudLibPath Condition="'$(DalamudLibPath)' == ''">$(APPDATA)\XIVLauncherCN\addon\Hooks\dev</DalamudLibPath>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+.sdk/
+artifacts/
+.vs/
+.idea/
+*.user
+*.suo
+*.pdb
+*.zip
+*.7z
