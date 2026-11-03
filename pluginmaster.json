@@ -1,0 +1,51 @@
+[
+  {
+    "Author": "Houraiji9",
+    "Name": "批量物品交易",
+    "InternalName": "BatchTrade",
+    "AssemblyVersion": "0.1.0.0",
+    "Description": "向选定玩家连续赠送指定物品；支持 HQ/NQ、总数量、每笔最多五格，对方手动确认。使用 /batchtrade 打开设置。",
+    "Punchline": "按指定数量分批交易物品，对方手动确认。",
+    "ApplicableVersion": "any",
+    "DalamudApiLevel": 15,
+    "RepoUrl": "https://github.com/Houraiji9/FFXIV-StandalonePlugins",
+    "Tags": [
+      "交易",
+      "物品",
+      "trade"
+    ],
+    "LoadRequiredState": 0,
+    "LoadSync": false,
+    "CanUnloadAsync": false,
+    "DownloadLinkInstall": "https://github.com/Houraiji9/FFXIV-StandalonePlugins/releases/download/v0.1.0/BatchTrade.zip",
+    "DownloadLinkUpdate": "https://github.com/Houraiji9/FFXIV-StandalonePlugins/releases/download/v0.1.0/BatchTrade.zip",
+    "DownloadLinkTesting": "https://github.com/Houraiji9/FFXIV-StandalonePlugins/releases/download/v0.1.0/BatchTrade.zip",
+    "LastUpdate": 1793717856,
+    "IsHide": false,
+    "IsTestingExclusive": false
+  },
+  {
+    "Author": "Houraiji9",
+    "Name": "雇员收取后制作",
+    "InternalName": "RetainerCraftBridge",
+    "AssemblyVersion": "0.1.0.0",
+    "Description": "保持 AutoRetainer 原生多角色轮换，在指定角色收完雇员后转入 Artisan 制作；开头角色的雇员再次到期后安全停工，回到开头继续轮换。需要兼容的 AutoRetainer、Lifestream 和 Artisan。",
+    "Punchline": "指定角色收完后制作，开头雇员到期后继续轮换",
+    "CanUnloadAsync": false,
+    "ApplicableVersion": "any",
+    "DalamudApiLevel": 15,
+    "RepoUrl": "https://github.com/Houraiji9/FFXIV-StandalonePlugins",
+    "Tags": [
+      "retainer",
+      "crafting",
+      "Artisan",
+      "AutoRetainer"
+    ],
+    "DownloadLinkInstall": "https://github.com/Houraiji9/FFXIV-StandalonePlugins/releases/download/v0.1.0/RetainerCraftBridge.zip",
+    "DownloadLinkUpdate": "https://github.com/Houraiji9/FFXIV-StandalonePlugins/releases/download/v0.1.0/RetainerCraftBridge.zip",
+    "DownloadLinkTesting": "https://github.com/Houraiji9/FFXIV-StandalonePlugins/releases/download/v0.1.0/RetainerCraftBridge.zip",
+    "LastUpdate": 1793717856,
+    "IsHide": false,
+    "IsTestingExclusive": false
+  }
+]
