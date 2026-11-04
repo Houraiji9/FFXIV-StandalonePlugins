@@ -1,0 +1,13 @@
+{
+  "Author": "Houraiji9",
+  "Name": "多角色雇员直售",
+  "InternalName": "RetainerVendorSweep",
+  "AssemblyVersion": "0.1.6.0",
+  "Description": "手动启动，按选定角色顺序通过附近雇员铃直售角色背包内符合条件的物品；白名单物品保留不售，所选角色处理一遍即停。角色来源为 AutoRetainer 已知角色，使用 Lifestream 换角，不自动发现全账号角色或导航到铃。",
+  "Punchline": "白名单保留，角色背包直售，多角色一遍即停",
+  "CanUnloadAsync": false,
+  "ApplicableVersion": "2026.10.06.0000.0000",
+  "DalamudApiLevel": 15,
+  "RepoUrl": "https://github.com/Houraiji9/FFXIV-StandalonePlugins",
+  "Tags": ["retainer", "inventory", "vendor", "AutoRetainer", "Lifestream"]
+}

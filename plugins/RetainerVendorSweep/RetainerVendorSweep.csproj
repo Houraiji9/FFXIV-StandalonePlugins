@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsDalamudPlugin>true</IsDalamudPlugin>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>RetainerVendorSweep</AssemblyName>
+    <RootNamespace>RetainerVendorSweep</RootNamespace>
+    <Version>0.1.6.0</Version>
+    <AssemblyVersion>0.1.6.0</AssemblyVersion>
+    <FileVersion>0.1.6.0</FileVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Update="RetainerVendorSweep.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

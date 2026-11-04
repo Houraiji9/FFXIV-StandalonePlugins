@@ -2,8 +2,8 @@ param(
     [string]$Tag = 'v0.1.0',
     [string]$Repository = 'Houraiji9/FFXIV-StandalonePlugins',
     [long]$Timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(),
-    [ValidateSet('BatchTrade', 'RetainerCraftBridge')]
-    [string[]]$Plugins = @('BatchTrade', 'RetainerCraftBridge'),
+    [ValidateSet('BatchTrade', 'RetainerCraftBridge', 'RetainerVendorSweep')]
+    [string[]]$Plugins = @('BatchTrade', 'RetainerCraftBridge', 'RetainerVendorSweep'),
     [string]$OutputDirectory
 )
 $ErrorActionPreference = 'Stop'
@@ -12,7 +12,7 @@ if ($Tag -notmatch '^v\d+\.\d+\.\d+(?:\.\d+)?$') { throw 'Tag must be a version 
 if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid GitHub repository.' }
 if ($Timestamp -lt 1) { throw 'Timestamp must be a positive Unix timestamp.' }
 if (!$Plugins -or $Plugins.Count -eq 0) { throw 'Select at least one plugin.' }
-$supported = @('BatchTrade', 'RetainerCraftBridge')
+$supported = @('BatchTrade', 'RetainerCraftBridge', 'RetainerVendorSweep')
 $selected = @($Plugins | ForEach-Object {
     $requested = $_
     $supported | Where-Object { $_ -ieq $requested }

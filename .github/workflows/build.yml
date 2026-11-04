@@ -14,7 +14,7 @@ on:
         required: false
         type: string
       tag:
-        description: 'Optional release tag, e.g. v0.1.1'
+        description: 'Optional release tag, e.g. v0.1.6'
         required: false
         type: string
 permissions:
@@ -44,7 +44,7 @@ jobs:
           REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $known = @('BatchTrade', 'RetainerCraftBridge')
+          $known = @('BatchTrade', 'RetainerCraftBridge', 'RetainerVendorSweep')
           $index = @(Get-Content pluginmaster.json -Raw | ConvertFrom-Json)
           $manifests = @{}
           foreach ($name in $known) {
