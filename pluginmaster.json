@@ -72,5 +72,31 @@
     "LastUpdate": 1793782415,
     "IsHide": false,
     "IsTestingExclusive": false
+  },
+  {
+    "Author": "Houraiji9",
+    "Name": "雇员工坊",
+    "InternalName": "RetainerWorkshop",
+    "AssemblyVersion": "0.1.7.0",
+    "Description": "统一雇员轮换、收取后制作与角色背包直售。按已确认的收取段累计，每天或每周达到设定轮数自动出售一次；达到运行上限后完成本轮已触发出售并整体待机。依赖 AutoRetainer/Lifestream，制作可选依赖 Artisan；独立第三方插件。",
+    "Punchline": "收取、制作、周期直售与轮次停机统一调度",
+    "CanUnloadAsync": false,
+    "ApplicableVersion": "2026.10.06.0000.0000",
+    "DalamudApiLevel": 15,
+    "RepoUrl": "https://github.com/Houraiji9/FFXIV-StandalonePlugins",
+    "Tags": [
+      "retainer",
+      "crafting",
+      "vendor",
+      "AutoRetainer",
+      "Artisan",
+      "Lifestream"
+    ],
+    "DownloadLinkInstall": "https://github.com/Houraiji9/FFXIV-StandalonePlugins/releases/download/v0.1.7/RetainerWorkshop.zip",
+    "DownloadLinkUpdate": "https://github.com/Houraiji9/FFXIV-StandalonePlugins/releases/download/v0.1.7/RetainerWorkshop.zip",
+    "DownloadLinkTesting": "https://github.com/Houraiji9/FFXIV-StandalonePlugins/releases/download/v0.1.7/RetainerWorkshop.zip",
+    "LastUpdate": 1793800098,
+    "IsHide": false,
+    "IsTestingExclusive": false
   }
 ]
