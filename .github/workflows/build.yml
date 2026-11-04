@@ -14,7 +14,7 @@ on:
         required: false
         type: string
       tag:
-        description: 'Optional release tag, e.g. v0.1.6'
+        description: 'Optional release tag, e.g. v0.1.7'
         required: false
         type: string
 permissions:
@@ -44,7 +44,7 @@ jobs:
           REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $known = @('BatchTrade', 'RetainerCraftBridge', 'RetainerVendorSweep')
+          $known = @('BatchTrade', 'RetainerCraftBridge', 'RetainerVendorSweep', 'RetainerWorkshop')
           $index = @(Get-Content pluginmaster.json -Raw | ConvertFrom-Json)
           $manifests = @{}
           foreach ($name in $known) {
@@ -79,6 +79,9 @@ jobs:
             $tag = if ($version.Revision -gt 0) { 'v' + $version.ToString() } else { 'v' + $version.ToString(3) }
           }
           ./scripts/Package.ps1 -Tag $tag -Repository $env:BUILD_REPOSITORY -Plugins $selected
+          if ($selected.Count -eq 1 -and $selected[0] -ceq 'RetainerWorkshop' -and $tag -ceq 'v0.1.7') {
+            ./scripts/Validate-WorkshopPackage.ps1 -PackageDirectory "artifacts/$tag" -BaselineIndex './pluginmaster.json'
+          }
           "directory=artifacts/$tag" >> $env:GITHUB_OUTPUT
           'packaged=true' >> $env:GITHUB_OUTPUT
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
