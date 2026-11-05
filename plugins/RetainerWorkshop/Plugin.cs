@@ -31,10 +31,9 @@ public sealed class Plugin : IDalamudPlugin, IWorkshopActions
     private readonly WorkshopWindow window;
     private readonly object configGate = new();
     private WorkshopConfiguration config;
-    private WorkshopUiState view = new(false, "尚未开始。", [], "", [], [], [], false);
+    private WorkshopUiState view = new(false, "尚未开始。", [], "", [], null, [], false);
     private VendorCharacter[] characters = [];
-    private string[] preview = [];
-    private ulong previewCid;
+    private InventoryPreviewSnapshot? inventoryPreview;
     private LegacyImportResult? import;
     private string? configurationIssue;
     private string message = "先刷新角色与配置规则；不会自动开始。";
@@ -130,7 +129,7 @@ public sealed class Plugin : IDalamudPlugin, IWorkshopActions
             if(configurationIssue != null) throw new InvalidOperationException(configurationIssue);
             if(State.Blocking) return;
             if(config.ValidateShape() is { } issue) throw new InvalidOperationException(issue);
-            pi.SavePluginConfig(config); preview = []; previewCid = 0;
+            pi.SavePluginConfig(config);
         }
         catch(Exception ex) { message = "配置未保存：" + ex.Message; }
     }
@@ -163,7 +162,7 @@ public sealed class Plugin : IDalamudPlugin, IWorkshopActions
             requireArtisan = !manual && selected.CraftEnabled;
             if(manual) coordinator.StartManualSale();
             else coordinator.Start(selected.Schedule, selected.StopAfterRounds, selected.CraftEnabled);
-            preview = []; previewCid = 0;
+            inventoryPreview = null;
             message = "本次配置与角色清单已冻结；手动停止优先于所有自动规则。";
         });
     }
@@ -203,7 +202,7 @@ public sealed class Plugin : IDalamudPlugin, IWorkshopActions
         try
         {
             ApplyStop();
-            if(previewCid != 0 && (!host.LoggedIn || host.CurrentCid != previewCid)) { preview = []; previewCid = 0; }
+            if(inventoryPreview != null && (!host.LoggedIn || host.CurrentCid != inventoryPreview.ContentId)) inventoryPreview = null;
             if(coordinator.Blocking || runtime.Blocking)
             {
                 if(!suppression.TryAcquire(out var error))
@@ -249,7 +248,7 @@ public sealed class Plugin : IDalamudPlugin, IWorkshopActions
         if(journal.NeedsAttention) detail += "\n" + journal.Detail;
         if(ledger.Issue != null) detail += "\n" + ledger.Issue;
         Volatile.Write(ref view, new(coordinator.Blocking || runtime.Blocking, detail, results, period,
-            characters.ToArray(), preview.ToArray(), import?.Preview ?? [], import != null && configurationIssue == null,
+            characters.ToArray(), inventoryPreview, import?.Preview ?? [], import != null && configurationIssue == null,
             interruption, Volatile.Read(ref pending) != 0));
     }
     private VendorCharacter[] ReadCharacters() => host.RegisteredCharacters().Select(x => new VendorCharacter(x.CID, x.Name, x.World)).ToArray();
@@ -261,19 +260,18 @@ public sealed class Plugin : IDalamudPlugin, IWorkshopActions
             throw new InvalidOperationException("AR 角色资料不完整，请先刷新 AR 缓存。");
         message = $"读取到 {characters.Length} 个 AR 已知角色；这不是全账号自动发现。";
     });
-    public void PreviewInventory()
+    public void PreviewInventory() => Queue(ReadInventoryPreview);
+    private unsafe void ReadInventoryPreview()
     {
-        SaleRules rules;
-        try { rules = config.Sales.Freeze(); } catch(Exception ex) { message = ex.Message; return; }
-        Queue(() => ReadInventoryPreview(rules));
-    }
-    private unsafe void ReadInventoryPreview(SaleRules rules)
-    {
+        // A failed refresh must not leave an old successful snapshot looking current.
+        inventoryPreview = null;
         if(coordinator.Blocking || !host.LoggedIn) throw new InvalidOperationException("请在已登录且空闲时预览背包。");
         if(nativeSale.CheckSupport() is { } issue) throw new InvalidOperationException(issue);
+        var cid = player.ContentId;
+        if(cid == 0 || !player.IsLoaded) throw new InvalidOperationException("角色资料尚未加载。");
         var inventory = InventoryManager.Instance();
         if(inventory == null) throw new InvalidOperationException("库存尚未加载。");
-        var lines = new List<string>(); var items = data.GetExcelSheet<Item>(); long quantity = 0;
+        var entries = new List<InventoryPreviewEntry>(); var items = data.GetExcelSheet<Item>();
         for(var page = 0; page < 4; page++)
         {
             var bag = inventory->GetInventoryContainer((InventoryType)page);
@@ -281,18 +279,19 @@ public sealed class Plugin : IDalamudPlugin, IWorkshopActions
             for(var slotIndex = 0; slotIndex < bag->Size; slotIndex++)
             {
                 var slot = bag->GetInventorySlot(slotIndex);
-                if(slot == null || slot->Quantity <= 0 || slot->IsSymbolic || !items.TryGetRow(slot->ItemId, out var item)) continue;
+                if(slot == null) throw new InvalidOperationException("普通背包格数据尚未完整加载。");
+                if(slot->ItemId == 0 || slot->Quantity <= 0) continue;
+                var known = items.TryGetRow(slot->ItemId, out var item);
                 var hq = (slot->Flags & InventoryItem.ItemFlags.HighQuality) != 0;
-                var candidate = new VendorItem(page, slotIndex, slot->ItemId, hq, checked((int)slot->Quantity), item.ItemUICategory.RowId,
-                    item.PriceLow, (slot->Flags & InventoryItem.ItemFlags.Collectable) == 0);
-                if(!rules.Matches(candidate)) continue;
-                quantity = checked(quantity + candidate.Quantity);
-                lines.Add($"{item.Name.ExtractText()}{(hq ? " HQ" : " NQ")} × {candidate.Quantity}（背包{page + 1}，格{slotIndex + 1}）");
+                var candidate = new VendorItem(page, slotIndex, slot->ItemId, hq, checked((int)slot->Quantity),
+                    known ? item.ItemUICategory.RowId : 0, known ? item.PriceLow : 0,
+                    known && !slot->IsSymbolic && (slot->Flags & InventoryItem.ItemFlags.Collectable) == 0);
+                entries.Add(new(candidate, known ? item.Name.ExtractText() : $"未知物品 #{slot->ItemId}"));
             }
         }
-        previewCid = player.ContentId;
-        preview = [$"当前角色匹配 {lines.Count} 格 / {quantity} 个；执行时另行核对原生资格与价格。", .. lines];
-        message = "这是当前角色的只读预览，不是其他角色的库存。";
+        if(!host.LoggedIn || player.ContentId != cid) throw new InvalidOperationException("读取期间角色发生变化，请重新读取背包。");
+        inventoryPreview = new(cid, entries, DateTimeOffset.UtcNow);
+        message = $"已读取当前角色普通背包 {entries.Count} 格；可在背包列表勾选物品，自动保存到出售名单。";
     }
     public void PreviewImport()
     {
@@ -319,7 +318,7 @@ public sealed class Plugin : IDalamudPlugin, IWorkshopActions
         if(coordinator.Blocking || import == null) return;
         var merged = LegacyImport.Apply(config, import);
         pi.SavePluginConfig(merged); config = merged; window.SetConfiguration(config); import = null;
-        preview = []; previewCid = 0;
+        inventoryPreview = null;
         message = "已导入并保存新配置；原配置保持原状，流程未自动开始。";
     });
     public void AcknowledgeInterruption() => Queue(() =>

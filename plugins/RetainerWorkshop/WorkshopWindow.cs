@@ -9,7 +9,7 @@ namespace RetainerWorkshop;
 
 // Runtime publishes fresh array snapshots; the UI never reads game pointers or invokes IPC directly.
 public sealed record WorkshopUiState(bool Blocking, string Detail, string[] Results, string PeriodDetail,
-    VendorCharacter[] Characters, string[] Preview, string[] ImportPreview, bool CanApplyImport,
+    VendorCharacter[] Characters, InventoryPreviewSnapshot? Inventory, string[] ImportPreview, bool CanApplyImport,
     bool InterruptionPending = false, bool OperationPending = false);
 
 public interface IWorkshopActions
@@ -35,7 +35,7 @@ public sealed class WorkshopWindow
     private readonly CatalogItem[] orderedItems;
     private readonly RecipeItem[] recipes;
     private readonly TimeZoneInfo[] zones;
-    private string itemSearch = "", protectSearch = "", recipeSearch = "";
+    private string itemSearch = "", protectSearch = "", recipeSearch = "", inventorySearch = "";
     private uint category;
     private bool selectedOnly;
     private int rulesRevision;
@@ -102,7 +102,7 @@ public sealed class WorkshopWindow
                 {
                     if(ImGui.BeginTabItem("角色与轮换")) { DrawRotation(state); ImGui.EndTabItem(); }
                     if(ImGui.BeginTabItem("制作与取料")) { DrawCraft(); ImGui.EndTabItem(); }
-                    if(ImGui.BeginTabItem("出售与保留名单")) { DrawSales(); ImGui.EndTabItem(); }
+                    if(ImGui.BeginTabItem("出售与保留名单")) { DrawSales(state); ImGui.EndTabItem(); }
                     if(ImGui.BeginTabItem("直售角色与延迟")) { DrawSaleCharacters(state); DrawSaleDelays(); ImGui.EndTabItem(); }
                     if(ImGui.BeginTabItem("日／周计划")) { DrawSchedule(); ImGui.EndTabItem(); }
                     if(ImGui.BeginTabItem("导入旧配置")) { DrawImport(state); ImGui.EndTabItem(); }
@@ -110,12 +110,6 @@ public sealed class WorkshopWindow
                 }
             }
             finally { ImGui.EndDisabled(); }
-            if(state.Preview.Length > 0 && ImGui.CollapsingHeader("当前角色背包预览"))
-            {
-                ImGui.BeginChild("inventory-preview", new Vector2(0, 140), true);
-                foreach(var line in state.Preview) ImGui.TextWrapped(line);
-                ImGui.EndChild();
-            }
             if(state.Results.Length > 0 && ImGui.CollapsingHeader("本次运行结果"))
                 foreach(var line in state.Results) ImGui.TextWrapped(line);
             DrawConfirmation(state);
@@ -215,14 +209,17 @@ public sealed class WorkshopWindow
     private static string ModeLabel(CraftMode mode) => mode switch
     { CraftMode.Standard => "标准制作", CraftMode.Quick => "简易制作", CraftMode.Inherit => "跟随 Artisan 设置（兼容）", _ => "无效模式" };
 
-    private void DrawSales()
+    private void DrawSales(WorkshopUiState state)
     {
         var rules = config.Sales;
         ImGui.TextWrapped("仅直售角色普通背包中匹配的整堆物品；白名单是保留不售名单，优先于出售品类和物品。不会出售雇员仓库，也不在这里输入部分数量。");
         var nq = rules.IncludeNq; var hq = rules.IncludeHq;
         if(ImGui.Checkbox("允许 NQ", ref nq)) { rules.IncludeNq = nq; Save(); }
         ImGui.SameLine(); if(ImGui.Checkbox("允许 HQ", ref hq)) { rules.IncludeHq = hq; Save(); }
-        if(ImGui.Button("预览当前角色背包")) actions.PreviewInventory();
+        if(ImGui.Button("读取／刷新当前角色背包")) actions.PreviewInventory();
+        DrawInventory(state.Inventory, rules);
+        if(ImGui.CollapsingHeader("从全部道具库添加／按品类出售"))
+        {
         if(ImGui.BeginCombo("品类筛选", category == 0 ? "全部品类（只筛选显示）" : categories.GetValueOrDefault(category, "未知品类")))
         {
             if(ImGui.Selectable("全部品类（只筛选显示）", category == 0)) category = 0;
@@ -262,6 +259,7 @@ public sealed class WorkshopWindow
         }
         if(filtered.Length > 200) ImGui.TextWrapped($"匹配 {filtered.Length} 项，显示前 200 项；请缩小搜索范围。");
         ImGui.EndChild();
+        }
         if(ImGui.CollapsingHeader("核对全部出售品类与保留名单"))
         {
             foreach(var id in rules.CategoryIds.Order()) ImGui.TextUnformatted("出售品类：" + categories.GetValueOrDefault(id, $"未知 #{id}"));
@@ -272,6 +270,42 @@ public sealed class WorkshopWindow
                 if(label.Contains(protectSearch, StringComparison.OrdinalIgnoreCase) || id.ToString() == protectSearch) ImGui.TextUnformatted($"保留不售：{label} #{id}");
             }
         }
+    }
+    private void DrawInventory(InventoryPreviewSnapshot? snapshot, SaleRules rules)
+    {
+        if(snapshot == null)
+        {
+            ImGui.TextWrapped("点击上方按钮读取当前角色普通背包，再勾选要出售的物品；无需先建立出售规则。");
+            return;
+        }
+        var contents = InventoryPreviewRules.Project(snapshot, rules);
+        ImGui.TextWrapped($"背包：{contents.Rows.Length} 种 / {contents.Slots} 格 / {contents.Quantity} 个；当前规则匹配：{contents.MatchedSlots} 格 / {contents.MatchedQuantity} 个。");
+        ImGui.TextWrapped($"读取时间 {snapshot.ReadAt.ToLocalTime():HH:mm:ss}；这是库存快照，背包变化后请刷新。勾选自动保存，同一道具所有堆叠共用名单，NQ/HQ 由上方开关控制。执行时仍重新核对资格与价格。");
+        ImGui.TextWrapped("保留名单优先；已保留物品须先明确取消“保留不售”才能选择出售。取消被整类规则选中的物品，会自动加入保留名单。");
+        if(contents.Slots == 0) { ImGui.TextWrapped("读取成功：当前普通背包没有物品。"); return; }
+        if(rules.ItemIds.Count == 0 && rules.CategoryIds.Count == 0)
+            ImGui.TextWrapped("尚未设置出售名单，请从下方勾选；背包物品仍全部显示。");
+        else if(contents.MatchedSlots == 0)
+            ImGui.TextWrapped("背包已读取，但没有物品匹配当前规则；请核对选择、保留名单和 NQ/HQ。");
+        ImGui.InputText("筛选背包物品名称或 ID", ref inventorySearch, 120);
+        var rows = contents.Rows.Where(x => x.Name.Contains(inventorySearch, StringComparison.OrdinalIgnoreCase)
+            || x.ItemId.ToString() == inventorySearch).ToArray();
+        ImGui.BeginChild("inventory-selection", new Vector2(0, 260), true);
+        foreach(var row in rows)
+        {
+            ImGui.PushID("inventory-" + row.ItemId);
+            var selected = row.Selected;
+            ImGui.BeginDisabled(row.Protected || !row.CanSelect);
+            if(ImGui.Checkbox("出售", ref selected) && InventoryPreviewRules.SetSaleSelection(rules, row, selected)) Save();
+            ImGui.EndDisabled(); ImGui.SameLine();
+            var keep = row.Protected;
+            if(ImGui.Checkbox("保留不售", ref keep) && InventoryPreviewRules.SetProtection(rules, row.ItemId, keep)) Save();
+            ImGui.SameLine(); ImGui.TextUnformatted($"{row.Name} #{row.ItemId} · NQ {row.NqQuantity} / HQ {row.HqQuantity} · {row.Slots} 格");
+            ImGui.TextWrapped($"{row.Status}；匹配 {row.MatchedQuantity} 个");
+            ImGui.PopID();
+        }
+        if(rows.Length == 0) ImGui.TextWrapped("当前搜索没有匹配的背包物品，请清空或调整搜索文字。");
+        ImGui.EndChild();
     }
     private bool Protected(uint id) => config.Sales.ProtectedItemIds.Contains(id) || config.Sales.CategoryProtectedItemIds.Values.Any(x => x.Contains(id));
 

@@ -11,8 +11,8 @@ $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $package = [IO.Path]::GetFullPath($PackageDirectory)
 $baselinePath = [IO.Path]::GetFullPath($BaselineIndex)
 $name = 'RetainerWorkshop'
-$version = '0.1.7.0'
-$tag = 'v0.1.7'
+$version = '0.1.8.0'
+$tag = 'v0.1.8'
 $game = '2026.10.06.0000.0000'
 $repository = 'https://github.com/Houraiji9/FFXIV-StandalonePlugins'
 $oldVersions = [ordered]@{ BatchTrade = '0.1.5.0'; RetainerCraftBridge = '0.1.4.0'; RetainerVendorSweep = '0.1.6.0' }

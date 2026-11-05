@@ -7,11 +7,13 @@
   <ItemGroup>
     <Compile Include="../../plugins/RetainerWorkshop/Configuration.cs" Link="Configuration.cs" />
     <Compile Include="../../plugins/RetainerWorkshop/LegacyImport.cs" Link="LegacyImport.cs" />
+    <Compile Include="../../plugins/RetainerWorkshop/InventoryPreview.cs" Link="InventoryPreview.cs" />
     <Compile Include="../../plugins/RetainerWorkshop/ScheduleLedger.cs" Link="ScheduleLedger.cs" />
     <Compile Include="../../plugins/RetainerCraftBridge/MaterialRules.cs" Link="MaterialRules.cs" />
     <Compile Include="../../plugins/RetainerCraftBridge/CraftContracts.cs" Link="CraftContracts.cs" />
     <Compile Include="../../plugins/RetainerVendorSweep/VendorDomain.cs" Link="VendorDomain.cs" />
     <Compile Include="DalamudConfigurationStub.cs" />
     <Compile Include="Program.cs" />
+    <Compile Include="InventoryPreviewTests.cs" />
   </ItemGroup>
 </Project>

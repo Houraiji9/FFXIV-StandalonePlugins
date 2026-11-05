@@ -115,4 +115,5 @@ var metadata = Edit(Vendor(), x => { x["$type"] = "Never.Load.This.Type, Missing
 Check(LegacyImport.TryPreview(current, null, metadata, out _, out _), "inert Dalamud type metadata never resolved");
 var namedModes = Edit(Bridge(), x => { x["RecipeModes"]!["123"] = "Quick"; x["RecipeModes"]!["$type"] = "ignored"; });
 Check(LegacyImport.TryPreview(current, namedModes, null, out var named, out _) && named!.Configuration.RecipeModes[123] == CraftMode.Quick, "legacy named mode safe parsing");
-Console.WriteLine($"RetainerWorkshop configuration/import: {checks} checks passed; no game or legacy plugin code executed.");
+InventoryPreviewTests.Run(Check);
+Console.WriteLine($"RetainerWorkshop configuration/import/inventory: {checks} checks passed; no game or legacy plugin code executed.");

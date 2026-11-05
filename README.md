@@ -1,6 +1,6 @@
 # FF14 独立插件
 
-同一仓库维护四个分别安装、分别配置的国服 Dalamud 插件。**雇员工坊 / RetainerWorkshop 0.1.7.0** 统一原制作桥接与直售功能，并增加日／周累计和轮次停机。BatchTrade 0.1.5.0、RetainerCraftBridge 0.1.4.0 和 RetainerVendorSweep 0.1.6.0 保留各自项目与配置，不会被新插件覆盖。可下载版本以自定义仓库索引和对应 GitHub Release 为准。
+同一仓库维护四个分别安装、分别配置的国服 Dalamud 插件。**雇员工坊 / RetainerWorkshop 0.1.8.0** 统一原制作桥接与直售功能，并增加日／周累计和轮次停机。本版支持读取当前背包后直接勾选出售物品，自动保存名单；空名单也能显示背包内容。BatchTrade 0.1.5.0、RetainerCraftBridge 0.1.4.0 和 RetainerVendorSweep 0.1.6.0 保留各自项目与配置，不会被新插件覆盖。可下载版本以自定义仓库索引和对应 GitHub Release 为准。
 
 **目标环境为国服 Soil / Dalamud API 15、.NET 10。离线编译和逻辑测试不代表真实客户端验收。** 游戏更新、插件更新后的接口兼容性需要重新核对。无需替换 DailyRoutines、AutoRetainer、Artisan 或 Lifestream 的 DLL。
 
@@ -84,7 +84,7 @@ dotnet run --project tests/RetainerWorkshop.Config.Tests/RetainerWorkshop.Config
 dotnet run --project tests/RetainerWorkshop.Tests/RetainerWorkshop.Tests.csproj -c Release
 ```
 
-2026-11-04 作者完整本地回归中，四个插件 Release 构建均为 0 警告、0 错误，**954 项检查通过**：新增工坊 347 项（104 账本、73 会话、68 配置、102 总调度），既有插件及引擎 607 项。证据与验证边界见 [VALIDATION.md](VALIDATION.md)。仅选新插件的包装须保留三个现有插件的完整索引条目，不重发旧包；独立审查、源码提交、Release、根索引和实际游戏验收各自以对应记录为准。
+2026-11-05 作者完整本地回归中，四个插件 Release 构建均为 0 警告、0 错误，**1030 项检查通过**：工坊 423 项（104 账本、89 会话、107 配置与背包、123 总调度），既有插件及引擎 607 项。证据与验证边界见 [VALIDATION.md](VALIDATION.md)。仅选新插件的包装须保留三个现有插件的完整索引条目，不重发旧包；独立审查、源码提交、Release、根索引和实际游戏验收各自以对应记录为准。
 
 GitHub Actions 在推送时执行构建和测试，根据 manifest 与已发布索引的版本差异选择要打包的插件。发布流程是：先验证构建产物，上传版本 Release 及 ZIP，然后将已验证 URL 对应的 `pluginmaster.json` 更新到主分支。源码推送与 Release 分发是独立步骤。
 
